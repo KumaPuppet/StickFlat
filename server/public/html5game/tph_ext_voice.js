@@ -275,8 +275,8 @@ function __voice_build_chain(raw) {
 	rumble.type = "highpass"; rumble.frequency.value = 90;
 	var comp = ctx.createDynamicsCompressor();
 	// Compression douce (une attaque trop rapide déforme les sons graves)
-	comp.threshold.value = -40; comp.knee.value = 30; comp.ratio.value = 3;
-	comp.attack.value = 0.012; comp.release.value = 0.3;
+	comp.threshold.value = -36; comp.knee.value = 30; comp.ratio.value = 2;
+	comp.attack.value = 0.015; comp.release.value = 0.3;
 	var post = ctx.createAnalyser();
 	post.fftSize = 1024;
 	var makeup = ctx.createGain();
@@ -507,6 +507,46 @@ function __voice_apply_send() {
 	}
 }
 
+// ---------- Qualité de la voix (codec Opus) ----------
+var __VOICE_BITRATE = 64000; // 64 kbit/s (par défaut les navigateurs utilisent ~32 kbit/s)
+
+// Règle le codec dans la description de connexion :
+//  - débit plus élevé (voix plus claire)
+//  - correction d'erreurs (un paquet perdu en wifi est reconstruit au lieu de faire un trou)
+//  - pas de coupure des silences (sinon le début des mots peut être mangé)
+function __voice_tune_sdp(sdp) {
+	try {
+		var m = sdp.match(/a=rtpmap:(\d+) opus\/48000/i);
+		if (!m) return sdp;
+		var pt = m[1];
+		var re = new RegExp("a=fmtp:" + pt + " ([^\\r\\n]*)");
+		var extra = { maxaveragebitrate: String(__VOICE_BITRATE), useinbandfec: "1", usedtx: "0", stereo: "0" };
+		if (re.test(sdp)) {
+			return sdp.replace(re, function (line, params) {
+				var kv = {};
+				params.split(";").forEach(function (p) { var i = p.indexOf("="); if (i > 0) kv[p.slice(0, i).trim()] = p.slice(i + 1).trim(); });
+				for (var k in extra) kv[k] = extra[k];
+				return "a=fmtp:" + pt + " " + Object.keys(kv).map(function (k) { return k + "=" + kv[k]; }).join(";");
+			});
+		}
+		var line = "a=fmtp:" + pt + " " + Object.keys(extra).map(function (k) { return k + "=" + extra[k]; }).join(";");
+		return sdp.replace(m[0], m[0] + "\r\n" + line);
+	} catch (e) { return sdp; }
+}
+
+// Débit maximal de notre envoi vers ce joueur
+function __voice_set_bitrate(pc) {
+	try {
+		pc.getSenders().forEach(function (s) {
+			if (!s.track || s.track.kind !== "audio") return;
+			var params = s.getParameters();
+			if (!params.encodings || !params.encodings.length) params.encodings = [{}];
+			params.encodings[0].maxBitrate = __VOICE_BITRATE;
+			s.setParameters(params).catch(function () {});
+		});
+	} catch (e) {}
+}
+
 // ---------- Connexion audio avec un joueur ----------
 
 function __voice_peer_create(id, sid) {
@@ -540,11 +580,12 @@ function __voice_peer_create(id, sid) {
 	};
 	pc.onconnectionstatechange = function () {
 		if (pc.connectionState === "failed" && p.initiator && pc.restartIce) pc.restartIce();
+		if (pc.connectionState === "connected") __voice_set_bitrate(pc);
 	};
 	if (p.initiator) {
 		pc.onnegotiationneeded = function () {
 			pc.createOffer().then(function (offer) {
-				return pc.setLocalDescription(offer);
+				return pc.setLocalDescription({ type: offer.type, sdp: __voice_tune_sdp(offer.sdp) });
 			}).then(function () {
 				__voice_signal(id, { sdp: pc.localDescription });
 			}).catch(function (err) { console.warn("[voice] offre :", err); });
@@ -580,7 +621,7 @@ function __voice_on_signal(from, sid, data) {
 			p.pendingIce = [];
 			if (data.sdp.type === "offer") {
 				return pc.createAnswer().then(function (answer) {
-					return pc.setLocalDescription(answer);
+					return pc.setLocalDescription({ type: answer.type, sdp: __voice_tune_sdp(answer.sdp) });
 				}).then(function () {
 					__voice_signal(from, { sdp: pc.localDescription });
 				});
