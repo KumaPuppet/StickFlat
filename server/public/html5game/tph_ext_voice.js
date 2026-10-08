@@ -114,8 +114,8 @@ var __VOICE_VOICING_MIN = 0.55;     // à partir de quel "voisement" on considè
 var __VOICE_STABILITY_MIN = 0.3;    // une voix garde un volume stable (un choc s'éteint vite)
 var __VOICE_NO_VOICE_CLOSE = 1200;  // ms sans voix (seulement des bruits) avant de fermer
 var __VOICE_DELAY = 0.15;           // retard du son envoyé (secondes)
-var __VOICE_TARGET_RMS = 0.1;       // volume visé pour la voix envoyée
-var __VOICE_MAX_GAIN = 8;           // on peut monter un micro faible jusqu'à x8
+var __VOICE_TARGET_RMS = 0.07;      // volume visé pour la voix envoyée
+var __VOICE_MAX_GAIN = 4;           // on peut monter un micro faible jusqu'à x4 (plus = souffle et grésillement)
 
 var __VOICE_GATE_STEP = 20;     // on vérifie le volume toutes les 20 ms
 var __VOICE_GATE_ATTACK = 100;  // il faut 100 ms de voix continue pour ouvrir (un clic dure moins)
@@ -139,14 +139,24 @@ function voice_start(url, code, token) {
 	}
 	V.state = "asking";
 	navigator.mediaDevices.getUserMedia({
-		audio: { echoCancellation: true, noiseSuppression: true, autoGainControl: true },
+		// autoGainControl désactivé : c'est notre propre volume automatique qui s'en charge
+		// (les deux ensemble se "battent" et font grésiller)
+		audio: { echoCancellation: true, noiseSuppression: true, autoGainControl: false },
 		video: false
 	}).then(function (stream) {
 		if (V.state !== "asking") { stream.getTracks().forEach(function (t) { t.stop(); }); return; }
 		V.stream = stream;
 		V.sendStream = stream;
 		try {
-			V.ctx = new (window.AudioContext || window.webkitAudioContext)();
+			// Même fréquence que le micro : pas de conversion (source de craquements)
+			var AC = window.AudioContext || window.webkitAudioContext;
+			var rate = 0;
+			try { rate = stream.getAudioTracks()[0].getSettings().sampleRate || 0; } catch (e) {}
+			try {
+				V.ctx = rate ? new AC({ sampleRate: rate, latencyHint: "interactive" }) : new AC({ latencyHint: "interactive" });
+			} catch (e) {
+				V.ctx = new AC();
+			}
 			if (V.ctx.state === "suspended") V.ctx.resume();
 			__voice_build_chain(stream);
 		} catch (e) {
@@ -187,6 +197,7 @@ function voice_stop() {
 	V.detect = null;
 	V.post = null;
 	V.makeup = null;
+	V.gateGain = null;
 	V.sendStream = null;
 	V.sendTo = [];
 	return 1;
@@ -263,19 +274,25 @@ function __voice_build_chain(raw) {
 	var rumble = ctx.createBiquadFilter();
 	rumble.type = "highpass"; rumble.frequency.value = 90;
 	var comp = ctx.createDynamicsCompressor();
-	comp.threshold.value = -42; comp.knee.value = 18; comp.ratio.value = 3.5;
-	comp.attack.value = 0.004; comp.release.value = 0.25;
+	// Compression douce (une attaque trop rapide déforme les sons graves)
+	comp.threshold.value = -40; comp.knee.value = 30; comp.ratio.value = 3;
+	comp.attack.value = 0.012; comp.release.value = 0.3;
 	var post = ctx.createAnalyser();
 	post.fftSize = 1024;
 	var makeup = ctx.createGain();
 	makeup.gain.value = 1;
 	var limiter = ctx.createDynamicsCompressor();
-	limiter.threshold.value = -3; limiter.knee.value = 0; limiter.ratio.value = 20;
-	limiter.attack.value = 0.001; limiter.release.value = 0.1;
+	// Limiteur doux : évite la saturation sans "écrêter" (un limiteur trop brutal grésille)
+	limiter.threshold.value = -6; limiter.knee.value = 6; limiter.ratio.value = 12;
+	limiter.attack.value = 0.003; limiter.release.value = 0.25;
+	// Ouverture / fermeture du micro en fondu (au lieu d'une coupure nette qui fait "clic")
+	var gate = ctx.createGain();
+	gate.gain.value = 0;
 	var dest = ctx.createMediaStreamDestination();
 
 	src.connect(delay); delay.connect(rumble); rumble.connect(comp); comp.connect(makeup);
-	makeup.connect(limiter); limiter.connect(dest);
+	makeup.connect(limiter); limiter.connect(gate); gate.connect(dest);
+	V.gateGain = gate;
 	comp.connect(post);
 	V.post = { node: post, buf: new Float32Array(post.fftSize) };
 	V.makeup = makeup;
@@ -374,7 +391,7 @@ function __voice_gate_tick() {
 		if (pr > 0.0005) {
 			V.speechRms = (V.speechRms === 0) ? pr : V.speechRms * 0.97 + pr * 0.03;
 			var g = Math.max(1, Math.min(__VOICE_MAX_GAIN, __VOICE_TARGET_RMS / V.speechRms));
-			V.makeup.gain.setTargetAtTime(g, V.ctx.currentTime, 0.8);
+			V.makeup.gain.setTargetAtTime(g, V.ctx.currentTime, 1.5); // changements de volume lents
 		}
 	}
 
@@ -475,9 +492,18 @@ function __voice_on_peers(msg) {
 function __voice_apply_send() {
 	var V = __voice;
 	var tx = __voice_transmitting();
+	// Le fondu d'ouverture/fermeture se fait sur le son lui-même (si le traitement audio marche) ;
+	// les pistes vers chaque joueur restent, elles, coupées pour ceux qui n'ont pas le droit d'entendre
+	var useFade = !!(V.gateGain && V.ctx);
+	if (useFade) {
+		var now = V.ctx.currentTime;
+		V.gateGain.gain.cancelScheduledValues(now);
+		V.gateGain.gain.setTargetAtTime(tx ? 1 : 0, now, tx ? 0.006 : 0.03);
+	}
 	for (var id in V.peers) {
 		var p = V.peers[id];
-		if (p.track) p.track.enabled = tx && V.sendTo.indexOf(id) >= 0;
+		var allowed = V.sendTo.indexOf(id) >= 0;
+		if (p.track) p.track.enabled = allowed && (useFade ? V.micOn : tx);
 	}
 }
 

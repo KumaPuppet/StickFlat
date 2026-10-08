@@ -440,9 +440,8 @@ const server = http.createServer((req, res) => {
         : "Introuvable\n");
     }
     const type = MIME[path.extname(file).toLowerCase()] || "application/octet-stream";
-    // index.html jamais en cache (pour avoir la dernière version du jeu), le reste 1 heure
-    const cache = file.endsWith("index.html") ? "no-cache" : "public, max-age=3600";
-    res.writeHead(200, { "Content-Type": type, "Cache-Control": cache });
+    // "no-cache" : le navigateur vérifie toujours qu'il a la dernière version du jeu
+    res.writeHead(200, { "Content-Type": type, "Cache-Control": "no-cache" });
     res.end(data);
   });
 });
