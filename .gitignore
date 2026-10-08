@@ -1,0 +1,7 @@
+# Dépendances (Render les réinstalle tout seul)
+node_modules/
+
+# Fichiers système
+.DS_Store
+Thumbs.db
+*.log

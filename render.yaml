@@ -1,0 +1,14 @@
+# Configuration Render : un seul service web gratuit qui fait tourner le serveur
+# ET distribue le jeu (dossier server/public).
+services:
+  - type: web
+    name: botc
+    runtime: node
+    plan: free
+    rootDir: server
+    buildCommand: npm install
+    startCommand: npm start
+    healthCheckPath: /health
+    envVars:
+      - key: MIN_PLAYERS
+        value: "1"

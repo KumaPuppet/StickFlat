@@ -1,0 +1,16 @@
+{
+  "name": "botc-server",
+  "version": "0.1.0",
+  "description": "Serveur temps réel pour Blood on the Clocktower (GameMaker)",
+  "main": "server.js",
+  "type": "commonjs",
+  "scripts": {
+    "start": "node server.js"
+  },
+  "engines": {
+    "node": ">=18"
+  },
+  "dependencies": {
+    "ws": "^8.18.0"
+  }
+}
