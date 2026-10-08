@@ -1,7 +1,7 @@
 {
-  "name": "botc-server",
+  "name": "blood-on-the-moon-server",
   "version": "0.1.0",
-  "description": "Serveur temps réel pour Blood on the Clocktower (GameMaker)",
+  "description": "Serveur temps réel pour Blood on the Moon (GameMaker)",
   "main": "server.js",
   "type": "commonjs",
   "scripts": {

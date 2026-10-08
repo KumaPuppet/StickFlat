@@ -1,5 +1,5 @@
 @echo off
-title Serveur Blood on the Clocktower
+title Serveur Blood on the Moon
 cd /d "%~dp0server"
 if not exist node_modules (
   echo Installation des dependances...

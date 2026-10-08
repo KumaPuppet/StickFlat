@@ -1,5 +1,5 @@
 // =============================================================
-//  Serveur Blood on the Clocktower
+//  Serveur Blood on the Moon
 //  - Gère les rooms (création, code, rejoindre, reconnexion)
 //  - Gère la maison (déplacements) et les conversations
 //  - C'est lui qui décide ce que chaque joueur a le droit de voir
@@ -420,7 +420,7 @@ const server = http.createServer((req, res) => {
   // Petite page pour vérifier que le serveur tourne (utile pour Render)
   if (url.pathname === "/health") {
     res.writeHead(200, { "Content-Type": "text/plain; charset=utf-8" });
-    return res.end(`Serveur BotC en ligne - ${rooms.size} room(s)\n`);
+    return res.end(`Serveur Blood on the Moon en ligne - ${rooms.size} room(s)\n`);
   }
 
   // Fichiers du jeu (on refuse tout chemin qui sortirait du dossier "public")
@@ -507,5 +507,5 @@ setInterval(() => {
 }, 30 * 1000);
 
 server.listen(PORT, () => {
-  console.log(`Serveur BotC démarré sur le port ${PORT}`);
+  console.log(`Serveur Blood on the Moon démarré sur le port ${PORT}`);
 });
