@@ -10,11 +10,12 @@ const fs = require("fs");
 const path = require("path");
 const crypto = require("crypto");
 const { WebSocketServer } = require("ws");
-const { LOCATIONS, START, zoneExists } = require("./house");
+const { LOCATIONS, START, zoneExists, cancelMove } = require("./house");
 const { updateVoice } = require("./voice");
 const { grimHandlers, sendGrimoire, publicInfo, onWelcome, ROLES, REMINDERS } = require("./grimoire");
 const { phaseHandlers, isNight } = require("./phases");
 const { voteHandlers, publicVotes, stopVote, gameOverData } = require("./votes");
+const { speakHandlers, resetSpeak } = require("./speak");
 
 const PORT = process.env.PORT || 3000;
 const MAX_PLAYERS = 20;          // 15 joueurs + 5 voyageurs
@@ -22,7 +23,8 @@ const MAX_PLAYERS = 20;          // 15 joueurs + 5 voyageurs
 const MIN_PLAYERS = Number(process.env.MIN_PLAYERS || 1);
 const NAME_MAX = 16;
 const CHAT_MAX = 300;            // longueur max d'un message
-const JOIN_DELAY_MS = Number(process.env.JOIN_DELAY_MS ?? 2000); // décompte avant d'entrer dans une room
+const JOIN_DELAY_MS = Number(process.env.JOIN_DELAY_MS ?? 0);    // décompte avant d'entrer dans une room (0 = direct)
+const MOVE_DELAY_MS = Number(process.env.MOVE_DELAY_MS ?? 2000); // décompte avant d'entrer dans une autre salle de la maison
 const EMPTY_ROOM_TTL = 10 * 60 * 1000; // room supprimée après 10 min sans personne connecté
 
 /** @type {Map<string, Room>} */
@@ -66,6 +68,7 @@ class Room {
     this.stTalk = "none";   // vocal du Conteur : "none", "all" ou id d'un joueur
     this.stListen = "none"; // écoute du Conteur : "none", "all" ou "lieu/zone"
     this.pending = [];      // joueurs en train d'arriver (décompte de 2 secondes)
+    resetSpeak(this);       // micros coupés, mains levées (voir speak.js)
   }
 
   addPlayer(name, ws, isST) {
@@ -245,6 +248,7 @@ const handlers = {
     room.time = { kind: "setup", n: 0 };
     room.stTalk = "none";
     room.stListen = "none";
+    resetSpeak(room);
     room.broadcast("phase", { phase: room.phase });
     room.broadcast("clock", { started: false, elapsed: 0 });
     room.broadcastPlayers();
@@ -270,11 +274,12 @@ const handlers = {
     room.phase = "game";
     room.stTalk = "none";
     room.stListen = "none";
+    resetSpeak(room);
     room.grim = null; // les rôles seront distribués par le Conteur
     room.started = false; // puis il lancera la partie (rôles révélés + chronomètre)
     room.time = { kind: "setup", n: 0 };
     room.seats = [];
-    for (const p of room.players.values()) { p.loc = START.loc; p.zone = START.zone; }
+    for (const p of room.players.values()) { cancelMove(p); p.loc = START.loc; p.zone = START.zone; }
     room.broadcastPositions();
     room.broadcast("phase", { phase: room.phase });
     sendGrimoire(room);   // fixe aussi l'ordre des places
@@ -290,12 +295,34 @@ const handlers = {
     const { room, player } = ctx;
     if (!zoneExists(msg.loc, msg.zone)) return;
     if (isNight(room)) return; // la nuit, on ne bouge pas
+    cancelMove(player); // un nouveau clic remplace le déplacement en cours
     if (player.loc === msg.loc && player.zone === msg.zone) return;
 
-    player.loc = msg.loc;
-    player.zone = msg.zone;
-    room.broadcastPositions();
-    updateVoice(room);
+    const placePlayer = () => {
+      player.loc = msg.loc;
+      player.zone = msg.zone;
+      room.broadcastPositions();
+      updateVoice(room);
+    };
+    // Même salle (autre zone) : immédiat. Autre salle : décompte de 2 s,
+    // pendant lequel on reste (et on entend) là où on était.
+    if (player.loc === msg.loc || MOVE_DELAY_MS <= 0) return placePlayer();
+    send(ws, "moving", { loc: msg.loc, zone: msg.zone, ms: MOVE_DELAY_MS });
+    // Les gens déjà dans la salle d'arrivée sont prévenus : "Untel arrive..."
+    player.moveWatchers = [];
+    for (const p of room.players.values()) {
+      if (p.isST || p === player || p.loc !== msg.loc) continue;
+      send(p.ws, "arriving", { id: player.id, name: player.name, ms: MOVE_DELAY_MS });
+      player.moveWatchers.push(p.ws);
+    }
+    player.moveTimer = setTimeout(() => {
+      player.moveTimer = null;
+      player.moveWatchers = [];
+      if (!room.players.has(player.id) || room.phase === "lobby" || isNight(room)) {
+        return send(player.ws, "moving_cancel");
+      }
+      placePlayer();
+    }, MOVE_DELAY_MS);
   },
 
   // Le Conteur règle son vocal : qui il écoute et à qui il parle
@@ -367,7 +394,7 @@ const handlers = {
 };
 
 // Actions du grimoire (réservées au Conteur)
-Object.assign(handlers, grimHandlers, phaseHandlers, voteHandlers);
+Object.assign(handlers, grimHandlers, phaseHandlers, voteHandlers, speakHandlers);
 
 function leaveCurrentRoom(ws) {
   const ctx = ws.ctx;

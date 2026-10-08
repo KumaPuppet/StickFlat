@@ -16,6 +16,9 @@ function send(ws, type, data = {}) {
 function canHear(room, listener, speaker) {
   if (listener === speaker) return false;
 
+  // Micro coupé par le Conteur : les autres joueurs ne l'entendent plus (le Conteur, si)
+  if (room.phase !== "lobby" && room.muted && room.muted.has(speaker.id) && !listener.isST) return false;
+
   // Dans le lobby, tout le monde s'entend
   if (room.phase === "lobby") return true;
 
@@ -48,8 +51,15 @@ function updateVoice(room) {
     const sendTo = voiced.filter(q => canHear(room, q, p)).map(q => q.id);
     send(p.voiceWs, "v_peers", { me: p.id, peers, sendTo });
   }
+  // Prise de parole (voir speak.js) : rassemblement, mains levées, micros coupés
+  const speak = {
+    gathered: !!room.gathered,
+    hands: (room.speakHands || []).filter(id => room.players.has(id)),
+    muted: [...(room.muted || [])].filter(id => room.players.has(id)),
+  };
   // Chaque joueur sait si le Conteur lui parle en privé ou fait une annonce
   for (const p of room.players.values()) {
+    send(p.ws, "speak", speak);
     if (p.isST) {
       send(p.ws, "st_voice", { listen: room.stListen, talk: room.stTalk });
     } else {

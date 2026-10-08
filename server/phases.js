@@ -6,8 +6,9 @@
 //  La nuit : les joueurs ne s'entendent plus et ne bougent plus (voir voice.js).
 // =============================================================
 const { updateVoice } = require("./voice");
-const { START } = require("./house");
+const { START, cancelMove } = require("./house");
 const { newDay, stopVote, broadcastVotes } = require("./votes");
+const { endGathering } = require("./speak");
 
 function timeLabel(time) {
   if (!time || time.kind === "setup") return "Préparation";
@@ -34,6 +35,7 @@ function setTime(room, kind, n) {
   // Chaque changement de phase remet les nominations à zéro
   stopVote(room);
   room.day = newDay();
+  endGathering(room); // fin du rassemblement : les mains se baissent
   broadcastVotes(room);
   room.broadcast("time", { time: room.time });
   updateVoice(room);
@@ -76,8 +78,10 @@ const handlers = {
     const { room } = ctx;
     if (isNight(room)) return;
     for (const p of room.players.values()) {
-      if (!p.isST) { p.loc = START.loc; p.zone = START.zone; }
+      if (!p.isST) { cancelMove(p); p.loc = START.loc; p.zone = START.zone; }
     }
+    room.gathered = true;   // les joueurs peuvent lever la main pour parler
+    room.speakHands = [];
     room.broadcastPositions();
     updateVoice(room);
     room.broadcast("gathered"); // tout le monde passe sur la vue en cercle

@@ -33,4 +33,18 @@ function zoneExists(loc, zone) {
   return !!(l && l.zones.some(z => z.id === zone));
 }
 
-module.exports = { LOCATIONS, START, zoneExists };
+// Annule le déplacement en cours d'un joueur (décompte vers une autre salle)
+function cancelMove(player) {
+  if (!player.moveTimer) return;
+  clearTimeout(player.moveTimer);
+  player.moveTimer = null;
+  const ws = player.ws;
+  if (ws && ws.readyState === ws.OPEN) ws.send(JSON.stringify({ t: "moving_cancel" }));
+  // Ceux qu'on avait prévenus de son arrivée : finalement, il ne vient pas
+  for (const w of player.moveWatchers || []) {
+    if (w && w.readyState === w.OPEN) w.send(JSON.stringify({ t: "arriving_cancel", id: player.id }));
+  }
+  player.moveWatchers = [];
+}
+
+module.exports = { LOCATIONS, START, zoneExists, cancelMove };

@@ -40,11 +40,31 @@ function sendGrimoire(room) {
   });
 }
 
-// Le rôle d'un joueur, envoyé à lui seul (seulement une fois la partie lancée)
+// Infos maléfiques pour un joueur ("" sinon) : seul le Démon reçoit quelque chose
+// (ses Sbires et 3 rôles pour bluffer). Les Sbires ne reçoivent JAMAIS le nom du Démon.
+function evilInfoFor(room, playerId) {
+  const g = room.grim && room.grim.players[playerId];
+  if (!g || getRole(g.role).team !== "demon") return "";
+  const nameOf = id => (room.players.get(id) || { name: "?" }).name;
+  const minions = Object.entries(room.grim.players)
+    .filter(([, x]) => getRole(x.role).team === "minion").map(([id]) => id);
+  return `Tes Sbires sont : ${minions.map(nameOf).join(", ") || "aucun"}. ` +
+    `Rôles pas en jeu (pour bluffer) : ${room.grim.bluffs.map(roleName).join(", ")}.`;
+}
+
+// Le rôle d'un joueur, envoyé à lui seul (seulement une fois la partie lancée).
+// L'équipe maléfique ne voit ses alliés sur sa carte qu'une fois que le Conteur
+// a cliqué sur « Infos maléfiques » (rien d'automatique).
 function sendYourRole(room, player) {
   if (player.isST || !room.started) return;
   const g = room.grim && room.grim.players[player.id];
-  send(player.ws, "your_role", { role: g ? (g.fake || g.role) : "" });
+  const evil = room.grim && room.grim.evilShared ? evilInfoFor(room, player.id) : "";
+  send(player.ws, "your_role", { role: g ? (g.fake || g.role) : "", evil });
+}
+
+// Renvoie leur carte à tous les joueurs (ex : un rôle maléfique a changé)
+function sendAllRoles(room) {
+  for (const p of nonST(room)) sendYourRole(room, p);
 }
 
 // Message privé "système" du Conteur vers un joueur (affiché dans le fil privé)
@@ -128,7 +148,7 @@ const handlers = {
       g.reminders = msg.reminders.map(String).filter(r => REMINDERS.includes(r));
     }
     if (roleChanged && room.started) {
-      sendYourRole(room, target);
+      sendAllRoles(room); // l'équipe maléfique a pu changer
       systemPm(room, target, `Ton rôle a changé : tu es maintenant ${roleName(g.fake || g.role)}.`);
     }
     sendGrimoire(room);
@@ -142,29 +162,36 @@ const handlers = {
     systemPm(room, target, `Le Conteur te montre le rôle : ${roleName(msg.role)}.`);
   },
 
-  // Infos de l'équipe maléfique : les Sbires connaissent le Démon,
-  // le Démon connaît ses Sbires et 3 rôles pour bluffer
+  // Le Conteur montre le grimoire à un joueur (l'Espion) pendant quelques secondes
+  show_grimoire(ws, msg, ctx) {
+    const { room } = ctx;
+    const target = room.players.get(msg.pid);
+    if (!room.grim || !target || target.isST) return;
+    const secs = Math.min(60, Math.max(3, Math.round(Number(msg.seconds) || 15)));
+    ensureSeats(room);
+    send(target.ws, "grim_peek", { seats: room.seats, players: room.grim.players, ms: secs * 1000 });
+    systemPm(room, target, `Le Conteur te montre le grimoire pendant ${secs} secondes.`);
+  },
+
+  // Le Conteur referme le grimoire avant la fin du temps
+  hide_grimoire(ws, msg, ctx) {
+    const target = ctx.room.players.get(msg.pid);
+    if (target) send(target.ws, "grim_peek_end");
+  },
+
+  // Infos maléfiques : le Démon apprend qui sont ses Sbires et 3 rôles pour bluffer
+  // (les Sbires, eux, ne reçoivent rien)
   evil_info(ws, msg, ctx) {
     const { room } = ctx;
     if (!room.grim) return;
     if (!room.started) return send(ws, "error", { msg: "Lance d'abord la partie." });
-    const entries = Object.entries(room.grim.players);
-    const nameOf = id => (room.players.get(id) || { name: "?" }).name;
-    const demons = entries.filter(([, g]) => getRole(g.role).team === "demon").map(([id]) => id);
-    const minions = entries.filter(([, g]) => getRole(g.role).team === "minion").map(([id]) => id);
-
-    for (const id of minions) {
-      const others = minions.filter(m => m !== id).map(nameOf);
-      let text = `Le Démon est : ${demons.map(nameOf).join(", ") || "personne"}.`;
-      if (others.length) text += ` Les autres Sbires sont : ${others.join(", ")}.`;
-      systemPm(room, room.players.get(id), text);
+    room.grim.evilShared = true; // désormais affiché aussi sur leur carte de rôle
+    for (const p of nonST(room)) {
+      const text = evilInfoFor(room, p.id);
+      if (text) systemPm(room, p, text);
     }
-    for (const id of demons) {
-      const text = `Tes Sbires sont : ${minions.map(nameOf).join(", ") || "aucun"}. ` +
-        `Rôles pas en jeu (pour bluffer) : ${room.grim.bluffs.map(roleName).join(", ")}.`;
-      systemPm(room, room.players.get(id), text);
-    }
-    send(ws, "info", { msg: "Infos envoyées à l'équipe maléfique." });
+    sendAllRoles(room);
+    send(ws, "info", { msg: "Infos envoyées au Démon." });
   },
 
   // Le Conteur lance la partie : chacun découvre son rôle, le chronomètre démarre

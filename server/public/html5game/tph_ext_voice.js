@@ -94,6 +94,8 @@ var __voice = {
 	micOn: true,
 	// Appareils choisis ("" = celui par défaut du système)
 	inputId: "",
+	echo: true,         // anti-écho du navigateur (à couper avec un casque)
+	noise: true,        // réduction de bruit du navigateur
 	outputId: "",
 	volume: 1,          // volume des autres joueurs (0 à 1)
 	devices: { inputs: [], outputs: [] },
@@ -522,7 +524,9 @@ function __voice_apply_send() {
 function __voice_get_mic(deviceId) {
 	// autoGainControl désactivé : c'est notre propre volume automatique qui s'en charge
 	// (les deux ensemble se "battent" et font grésiller)
-	var base = { echoCancellation: true, noiseSuppression: true, autoGainControl: false };
+	var V = __voice;
+	var base = { echoCancellation: V.echo, noiseSuppression: V.noise, autoGainControl: false,
+		channelCount: 1, sampleRate: 48000 }; // qualité maximale du micro (48 kHz, mono)
 	var withDevice = {};
 	for (var k in base) withDevice[k] = base[k];
 	if (deviceId) withDevice.deviceId = { exact: deviceId };
@@ -571,7 +575,27 @@ function voice_set_input(id) {
 	if (id === V.inputId && V.state === "ready") return 1;
 	V.inputId = id;
 	if (V.state !== "ready") return 1; // sera utilisé au démarrage du micro
-	__voice_get_mic(id).then(function (stream) {
+	__voice_swap_mic();
+	return 1;
+}
+
+// Traitements du navigateur :
+//  echo  = anti-écho (indispensable avec des haut-parleurs, inutile avec un casque :
+//          le désactiver rend la voix bien plus naturelle)
+//  noise = réduction de bruit (enlève le souffle, mais peut donner un effet "sous l'eau")
+function voice_set_processing(echo, noise) {
+	var V = __voice;
+	echo = !!echo; noise = !!noise;
+	if (echo === V.echo && noise === V.noise) return 1;
+	V.echo = echo; V.noise = noise;
+	if (V.state === "ready") __voice_swap_mic(); // il faut rouvrir le micro avec les nouveaux réglages
+	return 1;
+}
+
+// Rouvre le micro (autre appareil ou autres réglages) sans couper les conversations
+function __voice_swap_mic() {
+	var V = __voice;
+	__voice_get_mic(V.inputId).then(function (stream) {
 		if (V.state !== "ready") { stream.getTracks().forEach(function (t) { t.stop(); }); return; }
 		var old = V.stream;
 		V.stream = stream;
@@ -598,7 +622,6 @@ function voice_set_input(id) {
 		__voice_apply_send();
 		voice_refresh_devices();
 	}).catch(function (err) { console.warn("[voice] changement de micro :", err); });
-	return 1;
 }
 
 // Change la sortie (casque / haut-parleurs). Chrome et Edge seulement.
@@ -634,7 +657,8 @@ function voice_input_level() {
 }
 
 // ---------- Qualité de la voix (codec Opus) ----------
-var __VOICE_BITRATE = 64000; // 64 kbit/s (par défaut les navigateurs utilisent ~32 kbit/s)
+var __VOICE_BITRATE = 96000; // 96 kbit/s (par défaut les navigateurs utilisent ~32 kbit/s)
+var __VOICE_JITTER_MS = 80;  // petit tampon de réception : absorbe les irrégularités du wifi
 
 // Règle le codec dans la description de connexion :
 //  - débit plus élevé (voix plus claire)
@@ -646,7 +670,8 @@ function __voice_tune_sdp(sdp) {
 		if (!m) return sdp;
 		var pt = m[1];
 		var re = new RegExp("a=fmtp:" + pt + " ([^\\r\\n]*)");
-		var extra = { maxaveragebitrate: String(__VOICE_BITRATE), useinbandfec: "1", usedtx: "0", stereo: "0" };
+		var extra = { maxaveragebitrate: String(__VOICE_BITRATE), maxplaybackrate: "48000",
+			useinbandfec: "1", usedtx: "0", stereo: "0" };
 		if (re.test(sdp)) {
 			return sdp.replace(re, function (line, params) {
 				var kv = {};
@@ -694,6 +719,7 @@ function __voice_peer_create(id, sid) {
 		if (e.candidate) __voice_signal(id, { ice: e.candidate });
 	};
 	pc.ontrack = function (e) {
+		try { if (e.receiver && "jitterBufferTarget" in e.receiver) e.receiver.jitterBufferTarget = __VOICE_JITTER_MS; } catch (err) {}
 		var stream = (e.streams && e.streams[0]) ? e.streams[0] : new MediaStream([e.track]);
 		if (!p.audio) {
 			p.audio = new Audio();
