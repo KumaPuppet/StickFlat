@@ -1,0 +1,585 @@
+// =============================================================
+//  ext_voice : vocal par zone pour Blood on the Moon (HTML5)
+//
+//  Ce fichier tourne dans le navigateur, à côté du jeu GameMaker.
+//  - Il demande l'accès au micro.
+//  - Il ouvre sa propre connexion au serveur pour se mettre en relation
+//    avec les autres joueurs.
+//  - Il crée une connexion audio directe (WebRTC) avec chaque joueur.
+//  - Le serveur lui dit à qui il a le droit d'envoyer sa voix ("sendTo") :
+//    aux autres, il envoie du silence.
+//
+//  Fonctions appelées depuis GameMaker :
+//    voice_start(url, code, token)  -> démarre le vocal
+//    voice_stop()                   -> arrête tout
+//    voice_set_mic(on)              -> 1 = micro ouvert, 0 = coupé
+//    voice_set_mode(mode)           -> "auto" (filtre anti-bruits) ou "ptt" (appuyer pour parler)
+//    voice_set_ptt(down)            -> mode "ptt" : 1 = touche enfoncée
+//    voice_set_threshold(t)         -> mode "auto" : de combien la voix doit dépasser le bruit de fond
+//                                      (2 = sensible, 3 = normal, 4.5 = filtre beaucoup)
+//    voice_state()                  -> "off", "asking", "ready", "denied", "error", "unsupported"
+//    voice_levels()                 -> texte JSON { idJoueur: volume entre 0 et 1 }
+// =============================================================
+
+// ---------- Fonctions "page web" (adresse du site, lien d'invitation) ----------
+
+// Nom du site qui affiche le jeu, ex : "botc-xxx.onrender.com"
+function web_page_host() {
+	return window.location.hostname;
+}
+
+// Port du site (443 pour https, 80 pour http si non précisé)
+function web_page_port() {
+	var p = window.location.port;
+	if (p) return parseInt(p, 10);
+	return window.location.protocol === "https:" ? 443 : 80;
+}
+
+// 1 si le site est en https (il faut alors une connexion wss:// sécurisée)
+function web_page_secure() {
+	return window.location.protocol === "https:" ? 1 : 0;
+}
+
+// Adresse de la page sans les paramètres, ex : "https://botc-xxx.onrender.com/"
+function web_page_base() {
+	return window.location.origin + window.location.pathname;
+}
+
+// Lit un paramètre de l'adresse, ex : ?room=ABCD -> web_get_param("room") = "ABCD"
+function web_get_param(name) {
+	try {
+		var v = new URLSearchParams(window.location.search).get(name);
+		return v ? v : "";
+	} catch (e) { return ""; }
+}
+
+// Copie un texte dans le presse-papiers. Renvoie 1 si c'est possible.
+function web_copy(text) {
+	try {
+		if (navigator.clipboard && navigator.clipboard.writeText) {
+			navigator.clipboard.writeText(text);
+			return 1;
+		}
+		var ta = document.createElement("textarea");
+		ta.value = text;
+		document.body.appendChild(ta);
+		ta.select();
+		document.execCommand("copy");
+		document.body.removeChild(ta);
+		return 1;
+	} catch (e) { return 0; }
+}
+
+var __voice = {
+	state: "off",
+	url: "", code: "", token: "",
+	ws: null, retry: null,
+	stream: null,      // micro brut
+	sendStream: null,  // micro traité (nettoyé + volume ajusté) : c'est lui qu'on envoie
+	ctx: null, localAnalyser: null,
+	detect: null,      // analyse de la bande de fréquences de la voix (pour le filtre)
+	pitch: null,       // analyse de la vibration des cordes vocales (voix ou bruit ?)
+	post: null,        // analyse après compression (pour le volume automatique)
+	makeup: null,      // gain automatique
+	me: "",
+	peers: {},      // id -> { id, sid, pc, track, audio, analyser, initiator, remoteSet, pendingIce }
+	sendTo: [],
+	micOn: true,
+	// Filtre anti-bruits : on ne transmet que si le son dure (une voix) et dépasse
+	// nettement le bruit de fond du micro. Un clic ou une touche, trop courts, sont ignorés.
+	mode: "auto",
+	pttDown: false,    // touche considérée comme enfoncée (avec un petit délai au relâchement)
+	pttWanted: false,  // touche réellement enfoncée
+	pttTimer: null,
+	lastVoicedAt: 0,
+	sensMult: 3,      // la voix doit être 3x plus forte que le bruit de fond
+	floor: 0,          // bruit de fond mesuré en continu
+	learnMs: 0,
+	speechRms: 0,      // volume moyen de la voix (pour le gain automatique)
+	gateOpen: false,
+	aboveMs: 0,
+	belowMs: 0,
+	gateTimer: null
+};
+
+var __VOICE_MIN_THRESHOLD = 0.0025; // en dessous, c'est forcément du silence
+var __VOICE_VOICING_MIN = 0.55;     // à partir de quel "voisement" on considère que c'est une voix
+var __VOICE_STABILITY_MIN = 0.3;    // une voix garde un volume stable (un choc s'éteint vite)
+var __VOICE_NO_VOICE_CLOSE = 1200;  // ms sans voix (seulement des bruits) avant de fermer
+var __VOICE_DELAY = 0.15;           // retard du son envoyé (secondes)
+var __VOICE_TARGET_RMS = 0.1;       // volume visé pour la voix envoyée
+var __VOICE_MAX_GAIN = 8;           // on peut monter un micro faible jusqu'à x8
+
+var __VOICE_GATE_STEP = 20;     // on vérifie le volume toutes les 20 ms
+var __VOICE_GATE_ATTACK = 100;  // il faut 100 ms de voix continue pour ouvrir (un clic dure moins)
+var __VOICE_GATE_RELEASE = 450; // on ferme après 450 ms de silence (pour ne pas couper les fins de mots)
+
+// Serveurs STUN publics : ils aident les navigateurs à se trouver à travers les box internet
+var __VOICE_ICE = [
+	{ urls: "stun:stun.l.google.com:19302" },
+	{ urls: "stun:stun1.l.google.com:19302" }
+];
+
+function voice_start(url, code, token) {
+	var V = __voice;
+	if ((V.state === "asking" || V.state === "ready") && V.code === code && V.token === token) return 1;
+	if (V.state !== "off") voice_stop();
+
+	V.url = url; V.code = code; V.token = token;
+	if (!navigator.mediaDevices || !navigator.mediaDevices.getUserMedia || !window.RTCPeerConnection) {
+		V.state = "unsupported";
+		return 0;
+	}
+	V.state = "asking";
+	navigator.mediaDevices.getUserMedia({
+		audio: { echoCancellation: true, noiseSuppression: true, autoGainControl: true },
+		video: false
+	}).then(function (stream) {
+		if (V.state !== "asking") { stream.getTracks().forEach(function (t) { t.stop(); }); return; }
+		V.stream = stream;
+		V.sendStream = stream;
+		try {
+			V.ctx = new (window.AudioContext || window.webkitAudioContext)();
+			if (V.ctx.state === "suspended") V.ctx.resume();
+			__voice_build_chain(stream);
+		} catch (e) {
+			console.warn("[voice] traitement audio indisponible :", e);
+			V.ctx = null;
+			V.detect = null;
+			V.sendStream = stream;
+		}
+		V.floor = 0;
+		V.learnMs = 0;
+		V.speechRms = 0;
+		V.localAnalyser = __voice_analyser(V.sendStream);
+		V.state = "ready";
+		V.gateTimer = setInterval(__voice_gate_tick, __VOICE_GATE_STEP);
+		__voice_connect();
+	}).catch(function (err) {
+		console.warn("[voice] micro :", err);
+		V.state = (err && (err.name === "NotAllowedError" || err.name === "SecurityError")) ? "denied" : "error";
+	});
+	return 1;
+}
+
+function voice_stop() {
+	var V = __voice;
+	V.state = "off";
+	if (V.retry) { clearTimeout(V.retry); V.retry = null; }
+	if (V.gateTimer) { clearInterval(V.gateTimer); V.gateTimer = null; }
+	if (V.pttTimer) { clearTimeout(V.pttTimer); V.pttTimer = null; }
+	V.pttDown = false;
+	V.pttWanted = false;
+	V.pitch = null;
+	V.gateOpen = false;
+	if (V.ws) { V.ws.onclose = null; try { V.ws.close(); } catch (e) {} V.ws = null; }
+	for (var id in V.peers) __voice_peer_close(id);
+	if (V.stream) { V.stream.getTracks().forEach(function (t) { t.stop(); }); V.stream = null; }
+	if (V.ctx) { try { V.ctx.close(); } catch (e) {} V.ctx = null; }
+	V.localAnalyser = null;
+	V.detect = null;
+	V.post = null;
+	V.makeup = null;
+	V.sendStream = null;
+	V.sendTo = [];
+	return 1;
+}
+
+function voice_set_mic(on) {
+	__voice.micOn = !!on;
+	__voice_apply_send();
+	return 1;
+}
+
+function voice_set_mode(mode) {
+	__voice.mode = (mode === "ptt") ? "ptt" : "auto";
+	__voice_apply_send();
+	return 1;
+}
+
+function voice_set_ptt(down) {
+	var V = __voice;
+	var d = !!down;
+	if (d === V.pttWanted) return 1;
+	V.pttWanted = d;
+	if (V.pttTimer) { clearTimeout(V.pttTimer); V.pttTimer = null; }
+	if (d) {
+		V.pttDown = true;
+		__voice_apply_send();
+	} else {
+		// Le son envoyé a 120 ms de retard : on attend un peu pour ne pas couper la fin
+		V.pttTimer = setTimeout(function () {
+			V.pttDown = false;
+			V.pttTimer = null;
+			__voice_apply_send();
+		}, __VOICE_DELAY * 1000 + 30);
+	}
+	return 1;
+}
+
+function voice_set_threshold(t) {
+	__voice.sensMult = Math.max(1.2, Math.min(10, +t || 3));
+	return 1;
+}
+
+// Chaîne de traitement du micro :
+//  - détection du volume : on n'écoute que la bande de la voix (250-3500 Hz)
+//  - détection de la voix : bande 70-900 Hz, là où l'on repère la vibration régulière
+//    des cordes vocales (un clic ou une touche n'a pas cette régularité)
+//  - envoi : léger retard (le filtre a le temps de décider sans couper le début des mots),
+//    on coupe les graves parasites, on compresse (les sons faibles remontent),
+//    on ajuste le volume automatiquement, et un limiteur évite la saturation
+function __voice_build_chain(raw) {
+	var V = __voice, ctx = V.ctx;
+	var src = ctx.createMediaStreamSource(raw);
+
+	var bandLow = ctx.createBiquadFilter();
+	bandLow.type = "highpass"; bandLow.frequency.value = 250;
+	var bandHigh = ctx.createBiquadFilter();
+	bandHigh.type = "lowpass"; bandHigh.frequency.value = 3500;
+	var det = ctx.createAnalyser();
+	det.fftSize = 1024;
+	src.connect(bandLow); bandLow.connect(bandHigh); bandHigh.connect(det);
+	V.detect = { node: det, buf: new Float32Array(det.fftSize) };
+
+	var pitchLow = ctx.createBiquadFilter();
+	pitchLow.type = "highpass"; pitchLow.frequency.value = 70;
+	var pitchHigh = ctx.createBiquadFilter();
+	pitchHigh.type = "lowpass"; pitchHigh.frequency.value = 900;
+	var pitch = ctx.createAnalyser();
+	pitch.fftSize = 2048;
+	src.connect(pitchLow); pitchLow.connect(pitchHigh); pitchHigh.connect(pitch);
+	V.pitch = { node: pitch, buf: new Float32Array(pitch.fftSize) };
+
+	var delay = ctx.createDelay(1);
+	delay.delayTime.value = __VOICE_DELAY;
+	var rumble = ctx.createBiquadFilter();
+	rumble.type = "highpass"; rumble.frequency.value = 90;
+	var comp = ctx.createDynamicsCompressor();
+	comp.threshold.value = -42; comp.knee.value = 18; comp.ratio.value = 3.5;
+	comp.attack.value = 0.004; comp.release.value = 0.25;
+	var post = ctx.createAnalyser();
+	post.fftSize = 1024;
+	var makeup = ctx.createGain();
+	makeup.gain.value = 1;
+	var limiter = ctx.createDynamicsCompressor();
+	limiter.threshold.value = -3; limiter.knee.value = 0; limiter.ratio.value = 20;
+	limiter.attack.value = 0.001; limiter.release.value = 0.1;
+	var dest = ctx.createMediaStreamDestination();
+
+	src.connect(delay); delay.connect(rumble); rumble.connect(comp); comp.connect(makeup);
+	makeup.connect(limiter); limiter.connect(dest);
+	comp.connect(post);
+	V.post = { node: post, buf: new Float32Array(post.fftSize) };
+	V.makeup = makeup;
+	V.sendStream = dest.stream;
+}
+
+// Volume "réel" (RMS) d'un analyseur, entre 0 et 1
+function __voice_rms(a) {
+	if (!a) return 0;
+	a.node.getFloatTimeDomainData(a.buf);
+	var sum = 0;
+	for (var i = 0; i < a.buf.length; i++) sum += a.buf[i] * a.buf[i];
+	return Math.sqrt(sum / a.buf.length);
+}
+
+// "Voisement" : est-ce que le son se répète régulièrement, comme une voix ?
+// On compare le signal avec lui-même décalé d'une période de voix (75 à 400 Hz).
+// Résultat proche de 1 = voix, proche de 0 = bruit, clic, touche de clavier.
+function __voice_voicing(a, sampleRate) {
+	if (!a) return 1;
+	a.node.getFloatTimeDomainData(a.buf);
+	var x = a.buf, n = x.length;
+
+	// Un choc (touche, clic) s'éteint très vite : toute l'énergie est au début ou à la fin.
+	// Une voix garde un volume à peu près stable : on compare les deux moitiés.
+	var h1 = 0, h2 = 0, half = n >> 1;
+	for (var j = 0; j < half; j++) h1 += x[j] * x[j];
+	for (var j2 = half; j2 < n; j2++) h2 += x[j2] * x[j2];
+	if (Math.min(h1, h2) < Math.max(h1, h2) * __VOICE_STABILITY_MIN) return 0;
+
+	var minLag = Math.floor(sampleRate / 400);
+	var maxLag = Math.min(Math.floor(sampleRate / 75), Math.floor(n / 2));
+	var best = 0;
+	for (var lag = minLag; lag <= maxLag; lag += 2) {
+		var s = 0, e1 = 0, e2 = 0, m = n - lag;
+		for (var i = 0; i < m; i += 2) {
+			var u = x[i], v = x[i + lag];
+			s += u * v; e1 += u * u; e2 += v * v;
+		}
+		var r = s / Math.sqrt(e1 * e2 + 1e-12);
+		if (r > best) best = r;
+	}
+	return best;
+}
+
+// Est-ce qu'on transmet notre voix en ce moment ?
+function __voice_transmitting() {
+	var V = __voice;
+	if (!V.micOn) return false;
+	return (V.mode === "ptt") ? V.pttDown : V.gateOpen;
+}
+
+// Filtre anti-bruits (mode "auto")
+function __voice_gate_tick() {
+	var V = __voice;
+	if (!V.localAnalyser) return;
+	// Temps réel écoulé (le navigateur ralentit les minuteries quand l'onglet est caché)
+	var now = performance.now();
+	var dt = Math.min(100, now - (V.lastTick || now));
+	V.lastTick = now;
+	var was = V.gateOpen;
+
+	// Sans traitement audio (vieux navigateur) : pas de filtre, le micro reste ouvert
+	if (!V.detect) {
+		V.gateOpen = true;
+		if (!was) __voice_apply_send();
+		return;
+	}
+
+	var lv = __voice_rms(V.detect);
+	var voicing = __voice_voicing(V.pitch, V.ctx.sampleRate);
+	var voiced = voicing >= __VOICE_VOICING_MIN;
+
+	// 1) Bruit de fond : mesuré quand on ne parle pas.
+	//    Il descend vite (le silence revient) et monte lentement (un ventilateur s'allume).
+	if (!V.gateOpen && !voiced) {
+		if (V.learnMs < 1500) {
+			V.learnMs += dt;
+			V.floor = (V.floor === 0) ? lv : V.floor * 0.8 + lv * 0.2;
+		} else if (lv < V.floor) {
+			V.floor += (lv - V.floor) * 0.3;
+		} else {
+			V.floor += (lv - V.floor) * Math.min(1, dt / 8000);
+		}
+		V.floor = Math.max(0.0003, V.floor);
+	}
+
+	// 2) Seuil : la voix doit dépasser nettement le bruit de fond.
+	//    Une fois ouvert, on tolère une voix un peu plus faible (fin de phrase).
+	var threshold = Math.max(__VOICE_MIN_THRESHOLD, V.floor * V.sensMult);
+	if (V.gateOpen) threshold *= 0.6;
+
+	// 3) Volume automatique : on vise le même volume pour tout le monde
+	if (V.gateOpen && V.post && V.makeup) {
+		var pr = __voice_rms(V.post);
+		if (pr > 0.0005) {
+			V.speechRms = (V.speechRms === 0) ? pr : V.speechRms * 0.97 + pr * 0.03;
+			var g = Math.max(1, Math.min(__VOICE_MAX_GAIN, __VOICE_TARGET_RMS / V.speechRms));
+			V.makeup.gain.setTargetAtTime(g, V.ctx.currentTime, 0.8);
+		}
+	}
+
+	// 4) Décision
+	//  - pour OUVRIR : il faut un son assez fort ET qui ressemble à une voix, pendant 80 ms
+	//  - une fois ouvert : on reste ouvert tant qu'il y a du son (les consonnes comme
+	//    "s" ou "f" ne sont pas "voisées", il ne faut pas les couper)
+	//  - mais si plus rien ne ressemble à une voix pendant 1,2 s, on ferme
+	//    (quelqu'un qui tape au clavier juste après avoir parlé)
+	var loud = lv >= threshold;
+	if (loud && voiced) {
+		V.aboveMs += dt;
+		// "Il y a encore de la voix" seulement après 100 ms de voix continue
+		// (deux frappes rapprochées peuvent ressembler à une voix une fraction de seconde)
+		if (V.aboveMs >= __VOICE_GATE_ATTACK) V.lastVoicedAt = now;
+	} else {
+		V.aboveMs = 0; // il faut de la voix SANS interruption (des touches successives ne s'additionnent pas)
+	}
+	if (!V.gateOpen) {
+		if (V.aboveMs >= __VOICE_GATE_ATTACK) {
+			V.gateOpen = true;
+			V.belowMs = 0;
+		}
+	} else {
+		V.belowMs = loud ? 0 : V.belowMs + dt;
+		if (V.belowMs >= __VOICE_GATE_RELEASE || now - V.lastVoicedAt > __VOICE_NO_VOICE_CLOSE) {
+			V.gateOpen = false;
+			V.aboveMs = 0;
+		}
+	}
+	if (was !== V.gateOpen) __voice_apply_send();
+}
+
+function voice_state() {
+	return __voice.state;
+}
+
+function voice_levels() {
+	var V = __voice;
+	var out = {};
+	if (V.state !== "ready") return "{}";
+	if (V.ctx && V.ctx.state === "suspended") V.ctx.resume();
+	// Mon propre volume : seulement quand ma voix est vraiment transmise
+	if (V.me && V.localAnalyser) out[V.me] = __voice_transmitting() ? __voice_level(V.localAnalyser) : 0;
+	for (var id in V.peers) {
+		var p = V.peers[id];
+		if (p.analyser) out[id] = __voice_level(p.analyser);
+	}
+	return JSON.stringify(out);
+}
+
+// ---------- Connexion au serveur (mise en relation) ----------
+
+function __voice_connect() {
+	var V = __voice;
+	var ws = new WebSocket(V.url);
+	V.ws = ws;
+	ws.onopen = function () {
+		ws.send(JSON.stringify({ t: "voice_hello", code: V.code, token: V.token }));
+	};
+	ws.onmessage = function (ev) {
+		var msg;
+		try { msg = JSON.parse(ev.data); } catch (e) { return; }
+		if (msg.t === "v_peers") __voice_on_peers(msg);
+		else if (msg.t === "v_signal") __voice_on_signal(msg.from, msg.sid, msg.data);
+		else if (msg.t === "v_error") console.warn("[voice]", msg.msg);
+	};
+	ws.onclose = function () {
+		// Coupure : on ferme les connexions audio et on réessaie dans 2 secondes
+		for (var id in V.peers) __voice_peer_close(id);
+		if (V.state === "ready") V.retry = setTimeout(__voice_connect, 2000);
+	};
+}
+
+function __voice_signal(to, data) {
+	var V = __voice;
+	if (V.ws && V.ws.readyState === 1) V.ws.send(JSON.stringify({ t: "v_signal", to: to, data: data }));
+}
+
+// Le serveur envoie la liste des joueurs et à qui on peut parler
+function __voice_on_peers(msg) {
+	var V = __voice;
+	V.me = msg.me;
+	V.sendTo = msg.sendTo || [];
+	var wanted = {};
+	for (var i = 0; i < msg.peers.length; i++) {
+		var info = msg.peers[i];
+		wanted[info.id] = true;
+		var p = V.peers[info.id];
+		if (p && p.sid !== info.sid) { __voice_peer_close(info.id); p = null; } // l'autre s'est reconnecté
+		if (!p) __voice_peer_create(info.id, info.sid);
+	}
+	for (var id in V.peers) if (!wanted[id]) __voice_peer_close(id);
+	__voice_apply_send();
+}
+
+// Active notre voix uniquement vers les joueurs autorisés
+function __voice_apply_send() {
+	var V = __voice;
+	var tx = __voice_transmitting();
+	for (var id in V.peers) {
+		var p = V.peers[id];
+		if (p.track) p.track.enabled = tx && V.sendTo.indexOf(id) >= 0;
+	}
+}
+
+// ---------- Connexion audio avec un joueur ----------
+
+function __voice_peer_create(id, sid) {
+	var V = __voice;
+	var pc = new RTCPeerConnection({ iceServers: __VOICE_ICE });
+	// Une copie de notre micro pour CE joueur : on peut la couper sans couper les autres
+	var track = V.sendStream.getAudioTracks()[0].clone();
+	track.enabled = false;
+	pc.addTrack(track, new MediaStream([track]));
+
+	var p = {
+		id: id, sid: sid, pc: pc, track: track, audio: null, analyser: null,
+		initiator: V.me < id, // un seul des deux lance la connexion
+		remoteSet: false, pendingIce: []
+	};
+	V.peers[id] = p;
+
+	pc.onicecandidate = function (e) {
+		if (e.candidate) __voice_signal(id, { ice: e.candidate });
+	};
+	pc.ontrack = function (e) {
+		var stream = (e.streams && e.streams[0]) ? e.streams[0] : new MediaStream([e.track]);
+		if (!p.audio) {
+			p.audio = new Audio();
+			p.audio.autoplay = true;
+		}
+		p.audio.srcObject = stream;
+		var play = p.audio.play();
+		if (play && play.catch) play.catch(function () {});
+		p.analyser = __voice_analyser(stream);
+	};
+	pc.onconnectionstatechange = function () {
+		if (pc.connectionState === "failed" && p.initiator && pc.restartIce) pc.restartIce();
+	};
+	if (p.initiator) {
+		pc.onnegotiationneeded = function () {
+			pc.createOffer().then(function (offer) {
+				return pc.setLocalDescription(offer);
+			}).then(function () {
+				__voice_signal(id, { sdp: pc.localDescription });
+			}).catch(function (err) { console.warn("[voice] offre :", err); });
+		};
+	}
+	return p;
+}
+
+function __voice_peer_close(id) {
+	var V = __voice;
+	var p = V.peers[id];
+	if (!p) return;
+	try { p.pc.close(); } catch (e) {}
+	if (p.track) p.track.stop();
+	if (p.audio) { p.audio.srcObject = null; }
+	delete V.peers[id];
+}
+
+// Messages techniques WebRTC reçus d'un autre joueur
+function __voice_on_signal(from, sid, data) {
+	var V = __voice;
+	if (V.state !== "ready" || !data) return;
+	var p = V.peers[from];
+	if (!p || p.sid !== sid) {
+		if (p) __voice_peer_close(from);
+		p = __voice_peer_create(from, sid);
+	}
+	var pc = p.pc;
+	if (data.sdp) {
+		pc.setRemoteDescription(data.sdp).then(function () {
+			p.remoteSet = true;
+			for (var i = 0; i < p.pendingIce.length; i++) pc.addIceCandidate(p.pendingIce[i]).catch(function () {});
+			p.pendingIce = [];
+			if (data.sdp.type === "offer") {
+				return pc.createAnswer().then(function (answer) {
+					return pc.setLocalDescription(answer);
+				}).then(function () {
+					__voice_signal(from, { sdp: pc.localDescription });
+				});
+			}
+		}).catch(function (err) { console.warn("[voice] sdp :", err); });
+	} else if (data.ice) {
+		if (p.remoteSet) pc.addIceCandidate(data.ice).catch(function () {});
+		else p.pendingIce.push(data.ice);
+	}
+}
+
+// ---------- Mesure du volume (pour savoir qui parle) ----------
+
+function __voice_analyser(stream) {
+	var V = __voice;
+	if (!V.ctx) return null;
+	try {
+		var src = V.ctx.createMediaStreamSource(stream);
+		var an = V.ctx.createAnalyser();
+		an.fftSize = 512;
+		src.connect(an);
+		return { node: an, buf: new Uint8Array(an.fftSize) };
+	} catch (e) { return null; }
+}
+
+function __voice_level(a) {
+	if (!a) return 0;
+	a.node.getByteTimeDomainData(a.buf);
+	var sum = 0;
+	for (var i = 0; i < a.buf.length; i++) {
+		var v = (a.buf[i] - 128) / 128;
+		sum += v * v;
+	}
+	return Math.min(1, Math.sqrt(sum / a.buf.length) * 4);
+}
