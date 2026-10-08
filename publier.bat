@@ -3,14 +3,19 @@ title Publier Blood on the Moon
 cd /d "%~dp0"
 echo.
 
-rem Si GameMaker a exporte le jeu ici (a la racine), on le range dans server\public
-if exist "index.html" (
+rem GameMaker exporte parfois le jeu a la racine du projet, parfois un dossier au-dessus (Downloads).
+rem On le range dans server\public. On verifie que c'est bien NOTRE jeu (fichier vocal tph_ext_voice.js).
+set "SRC="
+if exist "html5game\tph_ext_voice.js" set "SRC=."
+if not defined SRC if exist "..\html5game\tph_ext_voice.js" set "SRC=.."
+
+if defined SRC (
   echo Nouvel export trouve : rangement dans server\public...
   if exist "server\public\html5game" rmdir /s /q "server\public\html5game"
-  move /y "html5game" "server\public\" >nul
-  move /y "index.html" "server\public\" >nul
-  if exist "favicon.ico" move /y "favicon.ico" "server\public\" >nul
-  if exist "options.ini" move /y "options.ini" "server\public\" >nul
+  move /y "%SRC%\html5game" "server\public\" >nul
+  if exist "%SRC%\index.html" move /y "%SRC%\index.html" "server\public\" >nul
+  if exist "%SRC%\options.ini" move /y "%SRC%\options.ini" "server\public\" >nul
+  if "%SRC%"=="." if exist "favicon.ico" move /y "favicon.ico" "server\public\" >nul
   echo.
 )
 
