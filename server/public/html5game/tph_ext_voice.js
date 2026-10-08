@@ -92,6 +92,12 @@ var __voice = {
 	peers: {},      // id -> { id, sid, pc, track, audio, analyser, initiator, remoteSet, pendingIce }
 	sendTo: [],
 	micOn: true,
+	// Appareils choisis ("" = celui par défaut du système)
+	inputId: "",
+	outputId: "",
+	volume: 1,          // volume des autres joueurs (0 à 1)
+	devices: { inputs: [], outputs: [] },
+	srcNode: null, chainInputs: [],
 	// Filtre anti-bruits : on ne transmet que si le son dure (une voix) et dépasse
 	// nettement le bruit de fond du micro. Un clic ou une touche, trop courts, sont ignorés.
 	mode: "auto",
@@ -138,12 +144,7 @@ function voice_start(url, code, token) {
 		return 0;
 	}
 	V.state = "asking";
-	navigator.mediaDevices.getUserMedia({
-		// autoGainControl désactivé : c'est notre propre volume automatique qui s'en charge
-		// (les deux ensemble se "battent" et font grésiller)
-		audio: { echoCancellation: true, noiseSuppression: true, autoGainControl: false },
-		video: false
-	}).then(function (stream) {
+	__voice_get_mic(V.inputId).then(function (stream) {
 		if (V.state !== "asking") { stream.getTracks().forEach(function (t) { t.stop(); }); return; }
 		V.stream = stream;
 		V.sendStream = stream;
@@ -172,6 +173,7 @@ function voice_start(url, code, token) {
 		V.state = "ready";
 		V.gateTimer = setInterval(__voice_gate_tick, __VOICE_GATE_STEP);
 		__voice_connect();
+		voice_refresh_devices(); // les noms des appareils ne sont visibles qu'après l'accord du micro
 	}).catch(function (err) {
 		console.warn("[voice] micro :", err);
 		V.state = (err && (err.name === "NotAllowedError" || err.name === "SecurityError")) ? "denied" : "error";
@@ -198,6 +200,8 @@ function voice_stop() {
 	V.post = null;
 	V.makeup = null;
 	V.gateGain = null;
+	V.srcNode = null;
+	V.chainInputs = [];
 	V.sendStream = null;
 	V.sendTo = [];
 	return 1;
@@ -250,6 +254,8 @@ function voice_set_threshold(t) {
 function __voice_build_chain(raw) {
 	var V = __voice, ctx = V.ctx;
 	var src = ctx.createMediaStreamSource(raw);
+	V.srcNode = src;
+	V.chainInputs = []; // les premiers maillons de la chaîne (pour changer de micro sans tout refaire)
 
 	var bandLow = ctx.createBiquadFilter();
 	bandLow.type = "highpass"; bandLow.frequency.value = 250;
@@ -258,6 +264,7 @@ function __voice_build_chain(raw) {
 	var det = ctx.createAnalyser();
 	det.fftSize = 1024;
 	src.connect(bandLow); bandLow.connect(bandHigh); bandHigh.connect(det);
+	V.chainInputs.push(bandLow);
 	V.detect = { node: det, buf: new Float32Array(det.fftSize) };
 
 	var pitchLow = ctx.createBiquadFilter();
@@ -267,6 +274,7 @@ function __voice_build_chain(raw) {
 	var pitch = ctx.createAnalyser();
 	pitch.fftSize = 2048;
 	src.connect(pitchLow); pitchLow.connect(pitchHigh); pitchHigh.connect(pitch);
+	V.chainInputs.push(pitchLow);
 	V.pitch = { node: pitch, buf: new Float32Array(pitch.fftSize) };
 
 	var delay = ctx.createDelay(1);
@@ -290,6 +298,7 @@ function __voice_build_chain(raw) {
 	gate.gain.value = 0;
 	var dest = ctx.createMediaStreamDestination();
 
+	V.chainInputs.push(delay);
 	src.connect(delay); delay.connect(rumble); rumble.connect(comp); comp.connect(makeup);
 	makeup.connect(limiter); limiter.connect(gate); gate.connect(dest);
 	V.gateGain = gate;
@@ -507,6 +516,123 @@ function __voice_apply_send() {
 	}
 }
 
+// ---------- Choix des appareils (micro, sortie) et volume ----------
+
+// Ouvre le micro choisi ("" = celui par défaut). Si l'appareil n'existe plus, on prend celui par défaut.
+function __voice_get_mic(deviceId) {
+	// autoGainControl désactivé : c'est notre propre volume automatique qui s'en charge
+	// (les deux ensemble se "battent" et font grésiller)
+	var base = { echoCancellation: true, noiseSuppression: true, autoGainControl: false };
+	var withDevice = {};
+	for (var k in base) withDevice[k] = base[k];
+	if (deviceId) withDevice.deviceId = { exact: deviceId };
+	return navigator.mediaDevices.getUserMedia({ audio: withDevice, video: false }).catch(function (err) {
+		if (deviceId && err && (err.name === "OverconstrainedError" || err.name === "NotFoundError")) {
+			return navigator.mediaDevices.getUserMedia({ audio: base, video: false });
+		}
+		throw err;
+	});
+}
+
+// Met à jour la liste des appareils (les noms n'apparaissent qu'une fois le micro autorisé)
+function voice_refresh_devices() {
+	var V = __voice;
+	if (!navigator.mediaDevices || !navigator.mediaDevices.enumerateDevices) return 0;
+	navigator.mediaDevices.enumerateDevices().then(function (list) {
+		var ins = [], outs = [];
+		list.forEach(function (d) {
+			if (!d.deviceId || d.deviceId === "default" || d.deviceId === "communications") return; // doublons de Windows / appareils inconnus
+			var item = { id: d.deviceId, label: d.label || "Appareil sans nom" };
+			if (d.kind === "audioinput") ins.push(item);
+			else if (d.kind === "audiooutput") outs.push(item);
+		});
+		V.devices = { inputs: ins, outputs: outs };
+	}).catch(function () {});
+	return 1;
+}
+if (navigator.mediaDevices && navigator.mediaDevices.addEventListener) {
+	navigator.mediaDevices.addEventListener("devicechange", function () { voice_refresh_devices(); });
+}
+
+// Liste des appareils pour GameMaker (texte JSON)
+function voice_devices() {
+	var V = __voice;
+	var canOut = typeof HTMLMediaElement !== "undefined" && "setSinkId" in HTMLMediaElement.prototype;
+	return JSON.stringify({
+		inputs: V.devices.inputs, outputs: V.devices.outputs,
+		input: V.inputId, output: V.outputId, volume: V.volume, outputSupported: canOut,
+	});
+}
+
+// Change de micro (même en pleine partie : les autres joueurs ne sont pas déconnectés)
+function voice_set_input(id) {
+	var V = __voice;
+	id = id || "";
+	if (id === V.inputId && V.state === "ready") return 1;
+	V.inputId = id;
+	if (V.state !== "ready") return 1; // sera utilisé au démarrage du micro
+	__voice_get_mic(id).then(function (stream) {
+		if (V.state !== "ready") { stream.getTracks().forEach(function (t) { t.stop(); }); return; }
+		var old = V.stream;
+		V.stream = stream;
+		if (V.ctx && V.srcNode) {
+			// On branche le nouveau micro au début de la chaîne de traitement
+			try { V.srcNode.disconnect(); } catch (e) {}
+			V.srcNode = V.ctx.createMediaStreamSource(stream);
+			V.chainInputs.forEach(function (n) { V.srcNode.connect(n); });
+		} else {
+			// Sans traitement audio : on remplace la piste envoyée à chaque joueur
+			V.sendStream = stream;
+			V.localAnalyser = __voice_analyser(stream);
+			for (var pid in V.peers) {
+				var p = V.peers[pid];
+				var t = stream.getAudioTracks()[0].clone();
+				var sender = p.pc.getSenders().find(function (s) { return s.track === p.track; });
+				if (sender) sender.replaceTrack(t);
+				if (p.track) p.track.stop();
+				p.track = t;
+			}
+		}
+		if (old) old.getTracks().forEach(function (t) { t.stop(); });
+		V.floor = 0; V.learnMs = 0; V.speechRms = 0; // le nouveau micro a un autre bruit de fond
+		__voice_apply_send();
+		voice_refresh_devices();
+	}).catch(function (err) { console.warn("[voice] changement de micro :", err); });
+	return 1;
+}
+
+// Change la sortie (casque / haut-parleurs). Chrome et Edge seulement.
+function voice_set_output(id) {
+	var V = __voice;
+	V.outputId = id || "";
+	for (var pid in V.peers) if (V.peers[pid].audio) __voice_apply_output(V.peers[pid].audio);
+	return 1;
+}
+
+// Volume des autres joueurs (0 à 1)
+function voice_set_volume(v) {
+	var V = __voice;
+	V.volume = Math.max(0, Math.min(1, +v));
+	for (var pid in V.peers) if (V.peers[pid].audio) V.peers[pid].audio.volume = V.volume;
+	return 1;
+}
+
+function __voice_apply_output(audio) {
+	var V = __voice;
+	audio.volume = V.volume;
+	if (typeof audio.setSinkId === "function") {
+		audio.setSinkId(V.outputId || "").catch(function (err) { console.warn("[voice] sortie :", err); });
+	}
+}
+
+// Niveau du micro en direct (avant le filtre), pour vérifier qu'il capte bien (0 à 1)
+function voice_input_level() {
+	var V = __voice;
+	if (V.state !== "ready") return 0;
+	if (V.detect) return Math.min(1, __voice_rms(V.detect) * 8);
+	return V.localAnalyser ? __voice_level(V.localAnalyser) : 0;
+}
+
 // ---------- Qualité de la voix (codec Opus) ----------
 var __VOICE_BITRATE = 64000; // 64 kbit/s (par défaut les navigateurs utilisent ~32 kbit/s)
 
@@ -572,6 +698,7 @@ function __voice_peer_create(id, sid) {
 		if (!p.audio) {
 			p.audio = new Audio();
 			p.audio.autoplay = true;
+			__voice_apply_output(p.audio); // sortie (casque / haut-parleurs) et volume choisis
 		}
 		p.audio.srcObject = stream;
 		var play = p.audio.play();
