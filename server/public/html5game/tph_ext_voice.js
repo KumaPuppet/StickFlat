@@ -21,6 +21,13 @@
 //    voice_levels()                 -> texte JSON { idJoueur: volume entre 0 et 1 }
 // =============================================================
 
+// Fond de la page de la même couleur que le jeu (au lieu des bandes blanches autour)
+try {
+	document.documentElement.style.background = "#16101c";
+	if (document.body) document.body.style.background = "#16101c";
+	else window.addEventListener("DOMContentLoaded", function () { document.body.style.background = "#16101c"; });
+} catch (e) {}
+
 // ---------- Fonctions "page web" (adresse du site, lien d'invitation) ----------
 
 // Nom du site qui affiche le jeu, ex : "botc-xxx.onrender.com"
