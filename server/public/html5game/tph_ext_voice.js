@@ -60,6 +60,30 @@ function web_get_param(name) {
 	} catch (e) { return ""; }
 }
 
+// Petit son de notification (deux notes douces), au volume "des autres joueurs"
+var __beepCtx = null;
+function web_beep() {
+	try {
+		var vol = (typeof __voice !== "undefined") ? __voice.volume : 1;
+		if (vol <= 0) return 0;
+		if (!__beepCtx) __beepCtx = new (window.AudioContext || window.webkitAudioContext)();
+		var ctx = __beepCtx;
+		if (ctx.state === "suspended") ctx.resume();
+		[[660, 0], [990, 0.13]].forEach(function (n) {
+			var t0 = ctx.currentTime + n[1];
+			var osc = ctx.createOscillator(), g = ctx.createGain();
+			osc.type = "sine";
+			osc.frequency.value = n[0];
+			g.gain.setValueAtTime(0, t0);
+			g.gain.linearRampToValueAtTime(0.12 * vol, t0 + 0.02);
+			g.gain.exponentialRampToValueAtTime(0.0005, t0 + 0.35);
+			osc.connect(g); g.connect(ctx.destination);
+			osc.start(t0); osc.stop(t0 + 0.4);
+		});
+		return 1;
+	} catch (e) { return 0; }
+}
+
 // Copie un texte dans le presse-papiers. Renvoie 1 si c'est possible.
 function web_copy(text) {
 	try {
@@ -123,7 +147,7 @@ var __VOICE_STABILITY_MIN = 0.3;    // une voix garde un volume stable (un choc 
 var __VOICE_NO_VOICE_CLOSE = 1200;  // ms sans voix (seulement des bruits) avant de fermer
 var __VOICE_DELAY = 0.15;           // retard du son envoyé (secondes)
 var __VOICE_TARGET_RMS = 0.07;      // volume visé pour la voix envoyée
-var __VOICE_MAX_GAIN = 4;           // on peut monter un micro faible jusqu'à x4 (plus = souffle et grésillement)
+var __VOICE_MAX_GAIN = 1.5;         // petit complément seulement : c'est le navigateur qui règle le volume du micro
 
 var __VOICE_GATE_STEP = 20;     // on vérifie le volume toutes les 20 ms
 var __VOICE_GATE_ATTACK = 100;  // il faut 100 ms de voix continue pour ouvrir (un clic dure moins)
@@ -151,12 +175,12 @@ function voice_start(url, code, token) {
 		V.stream = stream;
 		V.sendStream = stream;
 		try {
-			// Même fréquence que le micro : pas de conversion (source de craquements)
+			// On laisse le navigateur choisir la fréquence de la carte son : sur Chrome, imposer
+			// une autre fréquence l'oblige à tout convertir en continu (= craquements).
+			// "balanced" : un peu plus de marge que "interactive", donc moins de coupures sur les PC lents.
 			var AC = window.AudioContext || window.webkitAudioContext;
-			var rate = 0;
-			try { rate = stream.getAudioTracks()[0].getSettings().sampleRate || 0; } catch (e) {}
 			try {
-				V.ctx = rate ? new AC({ sampleRate: rate, latencyHint: "interactive" }) : new AC({ latencyHint: "interactive" });
+				V.ctx = new AC({ latencyHint: "balanced" });
 			} catch (e) {
 				V.ctx = new AC();
 			}
@@ -525,8 +549,11 @@ function __voice_get_mic(deviceId) {
 	// autoGainControl désactivé : c'est notre propre volume automatique qui s'en charge
 	// (les deux ensemble se "battent" et font grésiller)
 	var V = __voice;
-	var base = { echoCancellation: V.echo, noiseSuppression: V.noise, autoGainControl: false,
-		channelCount: 1, sampleRate: 48000 }; // qualité maximale du micro (48 kHz, mono)
+	// autoGainControl activé : le réglage automatique du volume du navigateur (très bon sur Chrome)
+	// remonte les micros faibles ; le nôtre est réduit au minimum pour ne pas se battre avec lui.
+	// Pas de fréquence imposée : le micro garde la sienne (sinon conversion = craquements sur Chrome).
+	var base = { echoCancellation: V.echo, noiseSuppression: V.noise, autoGainControl: true,
+		channelCount: 1 };
 	var withDevice = {};
 	for (var k in base) withDevice[k] = base[k];
 	if (deviceId) withDevice.deviceId = { exact: deviceId };
