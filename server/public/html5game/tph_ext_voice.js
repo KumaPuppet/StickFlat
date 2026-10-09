@@ -228,6 +228,7 @@ function voice_stop() {
 	V.post = null;
 	V.makeup = null;
 	V.gateGain = null;
+	V.clickNode = null;
 	V.srcNode = null;
 	V.chainInputs = [];
 	V.sendStream = null;
@@ -334,6 +335,70 @@ function __voice_build_chain(raw) {
 	V.post = { node: post, buf: new Float32Array(post.fftSize) };
 	V.makeup = makeup;
 	V.sendStream = dest.stream;
+	__voice_add_click_suppressor(ctx, delay);
+}
+
+// ---------- Anti-clic (pendant qu'on parle) ----------
+// Un clic de souris ou une touche = un pic de son extrêmement bref et brutal
+// (il monte en moins d'une milliseconde, une syllabe monte progressivement).
+// On compare une enveloppe "rapide" (1 ms) à une enveloppe "lente" (60 ms) :
+// quand la rapide dépasse nettement la lente, on baisse le son ~25 ms.
+// Un petit retard interne (12 ms) permet de baisser AVANT que le clic ne sorte.
+var __VOICE_CLICK_WORKLET = [
+	"class ClickSuppressor extends AudioWorkletProcessor {",
+	"  constructor() {",
+	"    super();",
+	"    this.la = Math.round(sampleRate * 0.012);",
+	"    this.buf = new Float32Array(this.la); this.idx = 0;",
+	"    this.fast = 0; this.slow = 0; this.hold = 0; this.gain = 1;",
+	"    this.aF = Math.exp(-1 / (sampleRate * 0.0008));",
+	"    this.aS = Math.exp(-1 / (sampleRate * 0.06));",
+	"    this.holdN = Math.round(sampleRate * 0.025);",
+	"    this.port.onmessage = (e) => { this.enabled = !!e.data; };",
+	"    this.enabled = true; this.count = 0;",
+	"  }",
+	"  process(inputs, outputs) {",
+	"    const inp = inputs[0] && inputs[0][0];",
+	"    const out = outputs[0][0];",
+	"    if (!inp) { out.fill(0); return true; }",
+	"    for (let i = 0; i < inp.length; i++) {",
+	"      const x = inp[i], e = x * x;",
+	"      this.fast = this.aF * this.fast + (1 - this.aF) * e;",
+	"      this.slow = this.aS * this.slow + (1 - this.aS) * e;",
+	"      if (this.enabled && this.fast > 8 * this.slow && this.fast > 2e-5) {",
+	"        if (this.hold <= 0) this.count++;",
+	"        this.hold = this.la + this.holdN;",
+	"      }",
+	"      const target = this.hold > 0 ? 0.2 : 1;",
+	"      if (this.hold > 0) this.hold--;",
+	"      this.gain += (target - this.gain) * (target < this.gain ? 0.25 : 0.003);",
+	"      const y = this.buf[this.idx];",
+	"      this.buf[this.idx] = x;",
+	"      this.idx = (this.idx + 1) % this.la;",
+	"      out[i] = y * this.gain;",
+	"    }",
+	"    return true;",
+	"  }",
+	"}",
+	"registerProcessor('click-suppressor', ClickSuppressor);"
+].join("\n");
+
+function __voice_add_click_suppressor(ctx, nextNode) {
+	var V = __voice;
+	try {
+		if (!ctx.audioWorklet || typeof AudioWorkletNode === "undefined") return;
+		var url = URL.createObjectURL(new Blob([__VOICE_CLICK_WORKLET], { type: "application/javascript" }));
+		ctx.audioWorklet.addModule(url).then(function () {
+			if (V.ctx !== ctx || !V.srcNode) return; // le micro a été coupé entre-temps
+			var node = new AudioWorkletNode(ctx, "click-suppressor", { numberOfInputs: 1, numberOfOutputs: 1, outputChannelCount: [1] });
+			node.connect(nextNode);
+			// Le micro passe maintenant par l'anti-clic avant le reste de la chaîne
+			try { V.srcNode.disconnect(nextNode); } catch (e) {}
+			V.srcNode.connect(node);
+			V.chainInputs = V.chainInputs.map(function (n) { return n === nextNode ? node : n; });
+			V.clickNode = node;
+		}).catch(function (err) { console.warn("[voice] anti-clic indisponible :", err); });
+	} catch (e) {}
 }
 
 // Volume "réel" (RMS) d'un analyseur, entre 0 et 1
