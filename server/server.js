@@ -28,6 +28,12 @@ const MOVE_DELAY_MS = Number(process.env.MOVE_DELAY_MS ?? 2000); // décompte av
 const ZONE_DELAY_MS = Number(process.env.ZONE_DELAY_MS ?? 1500); // décompte pour changer de coin dans la même salle
 const EMPTY_ROOM_TTL = 10 * 60 * 1000; // room supprimée après 10 min sans personne connecté
 
+// Diagnostic du vocal : mesures techniques gardées en mémoire quelques heures (rien sur disque)
+const DIAG_KEY = process.env.DIAG_KEY || "bde5f4d191bcb588e7bd7619";
+const DIAG_KEEP_MS = 6 * 60 * 60 * 1000;
+const DIAG_MAX = 5000;
+const diagLog = [];
+
 /** @type {Map<string, Room>} */
 const rooms = new Map();
 
@@ -362,6 +368,22 @@ const handlers = {
     console.log(`[${room.code}] ${player.name} a activé le vocal`);
   },
 
+  // Mesures techniques du vocal envoyées par un navigateur (diagnostic, voir /diag)
+  diag(ws, msg) {
+    const ctx = ws.voiceCtx;
+    if (!ctx || ctx.player.voiceWs !== ws || !msg.data || typeof msg.data !== "object") return;
+    const text = JSON.stringify(msg.data);
+    if (text.length > 20000) return;
+    // On remplace les identifiants des autres joueurs par leur pseudo (plus lisible)
+    if (Array.isArray(msg.data.peers)) {
+      for (const p of msg.data.peers) { const q = ctx.room.players.get(p.id); if (q) p.name = q.name + (q.isST ? " (Conteur)" : ""); }
+    }
+    if (Array.isArray(msg.data.sendTo)) msg.data.sendTo = msg.data.sendTo.map(id => (ctx.room.players.get(id) || { name: id }).name);
+    diagLog.push({ at: new Date().toISOString(), room: ctx.room.code, name: ctx.player.name, data: msg.data });
+    const limit = Date.now() - DIAG_KEEP_MS;
+    while (diagLog.length > DIAG_MAX || (diagLog.length && Date.parse(diagLog[0].at) < limit)) diagLog.shift();
+  },
+
   // Message technique WebRTC à faire passer à un autre joueur
   v_signal(ws, msg) {
     const ctx = ws.voiceCtx;
@@ -452,6 +474,18 @@ const server = http.createServer((req, res) => {
   const url = new URL(req.url, "http://localhost");
 
   // Petite page pour vérifier que le serveur tourne (utile pour Render)
+  // Diagnostic du vocal (mesures techniques, jamais le son) : protégé par une clé
+  if (url.pathname === "/diag") {
+    if (url.searchParams.get("key") !== DIAG_KEY) {
+      res.writeHead(403);
+      return res.end();
+    }
+    const room = url.searchParams.get("room");
+    const list = room ? diagLog.filter(d => d.room === room.toUpperCase()) : diagLog;
+    res.writeHead(200, { "Content-Type": "application/json; charset=utf-8", "Cache-Control": "no-store" });
+    return res.end(JSON.stringify(list));
+  }
+
   if (url.pathname === "/health") {
     res.writeHead(200, { "Content-Type": "text/plain; charset=utf-8" });
     return res.end(`Serveur Blood on the Moon en ligne - ${rooms.size} room(s)\n`);

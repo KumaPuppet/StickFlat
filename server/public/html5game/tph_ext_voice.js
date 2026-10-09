@@ -198,6 +198,7 @@ function voice_start(url, code, token) {
 		V.localAnalyser = __voice_analyser(V.sendStream);
 		V.state = "ready";
 		V.gateTimer = setInterval(__voice_gate_tick, __VOICE_GATE_STEP);
+		if (!V.diagTimer) V.diagTimer = setInterval(__voice_diag_send, 10000); // diagnostic toutes les 10 s
 		__voice_connect();
 		voice_refresh_devices(); // les noms des appareils ne sont visibles qu'après l'accord du micro
 	}).catch(function (err) {
@@ -212,6 +213,7 @@ function voice_stop() {
 	V.state = "off";
 	if (V.retry) { clearTimeout(V.retry); V.retry = null; }
 	if (V.gateTimer) { clearInterval(V.gateTimer); V.gateTimer = null; }
+	if (V.diagTimer) { clearInterval(V.diagTimer); V.diagTimer = null; }
 	if (V.pttTimer) { clearTimeout(V.pttTimer); V.pttTimer = null; }
 	V.pttDown = false;
 	V.pttWanted = false;
@@ -400,6 +402,15 @@ function __voice_gate_tick() {
 	var lv = __voice_rms(V.detect);
 	var voicing = __voice_voicing(V.pitch, V.ctx.sampleRate);
 	var voiced = voicing >= __VOICE_VOICING_MIN;
+
+	// Diagnostic : on accumule quelques mesures entre deux envois
+	var dg = V.dg || (V.dg = { n: 0, lvSum: 0, lvMax: 0, open: 0, voiced: 0, loud: 0, clip: 0, dtMax: 0 });
+	dg.n++; dg.lvSum += lv; if (lv > dg.lvMax) dg.lvMax = lv;
+	if (V.gateOpen) dg.open++;
+	if (voiced) dg.voiced++;
+	if (lv >= Math.max(__VOICE_MIN_THRESHOLD, V.floor * V.sensMult)) dg.loud++;
+	if (dt > dg.dtMax) dg.dtMax = dt;
+	for (var ci = 0; ci < V.detect.buf.length; ci += 4) { if (Math.abs(V.detect.buf[ci]) > 0.95) { dg.clip++; break; } }
 
 	// 1) Bruit de fond : mesuré quand on ne parle pas.
 	//    Il descend vite (le silence revient) et monte lentement (un ventilateur s'allume).
@@ -681,6 +692,95 @@ function voice_input_level() {
 	if (V.state !== "ready") return 0;
 	if (V.detect) return Math.min(1, __voice_rms(V.detect) * 8);
 	return V.localAnalyser ? __voice_level(V.localAnalyser) : 0;
+}
+
+// ---------- Diagnostic (mesures techniques envoyées au serveur, jamais le son) ----------
+
+function __voice_browser() {
+	var ua = navigator.userAgent;
+	if (ua.indexOf("Edg/") >= 0) return "Edge";
+	if (ua.indexOf("OPR/") >= 0 || ua.indexOf("Opera") >= 0) return "Opera";
+	if (ua.indexOf("Firefox/") >= 0) return "Firefox";
+	if (ua.indexOf("Chrome/") >= 0) return "Chrome";
+	if (ua.indexOf("Safari/") >= 0) return "Safari";
+	return "Autre";
+}
+
+function __voice_diag_send() {
+	var V = __voice;
+	if (V.state !== "ready" || !V.ws || V.ws.readyState !== 1) return;
+	var dg = V.dg || { n: 0 };
+	V.dg = null;
+	var n = Math.max(1, dg.n || 0);
+	var track = V.stream && V.stream.getAudioTracks()[0];
+	var settings = {};
+	try { settings = track ? track.getSettings() : {}; } catch (e) {}
+	var data = {
+		browser: __voice_browser(),
+		ua: navigator.userAgent.slice(0, 160),
+		mic: {
+			label: track ? track.label : "", muted: track ? track.muted : null, readyState: track ? track.readyState : "",
+			sampleRate: settings.sampleRate, channelCount: settings.channelCount,
+			agc: settings.autoGainControl, echo: settings.echoCancellation, noise: settings.noiseSuppression,
+		},
+		ctx: V.ctx ? { rate: V.ctx.sampleRate, state: V.ctx.state, base: V.ctx.baseLatency, out: V.ctx.outputLatency } : null,
+		settings: { micOn: V.micOn, mode: V.mode, sensMult: V.sensMult, volume: V.volume, echo: V.echo, noise: V.noise },
+		gate: {
+			ticks: dg.n || 0,
+			levelAvg: +((dg.lvSum || 0) / n).toFixed(4), levelMax: +(dg.lvMax || 0).toFixed(4),
+			floor: +V.floor.toFixed(4), threshold: +Math.max(__VOICE_MIN_THRESHOLD, V.floor * V.sensMult).toFixed(4),
+			openPct: Math.round(100 * (dg.open || 0) / n), voicedPct: Math.round(100 * (dg.voiced || 0) / n),
+			loudPct: Math.round(100 * (dg.loud || 0) / n), clipTicks: dg.clip || 0, tickMaxMs: Math.round(dg.dtMax || 0),
+			makeup: V.makeup ? +V.makeup.gain.value.toFixed(2) : null,
+		},
+		sendTo: V.sendTo,
+		peers: [],
+	};
+	var prev = V.diagPrev || (V.diagPrev = {});
+	var jobs = Object.keys(V.peers).map(function (id) {
+		var p = V.peers[id];
+		var info = { id: id, conn: p.pc.connectionState, ice: p.pc.iceConnectionState, sending: !!(p.track && p.track.enabled) };
+		return p.pc.getStats().then(function (stats) {
+			var inb = null, out = null, rin = null, pair = null, cands = {};
+			stats.forEach(function (r) {
+				if (r.type === "inbound-rtp" && r.kind === "audio") inb = r;
+				else if (r.type === "outbound-rtp" && r.kind === "audio") out = r;
+				else if (r.type === "remote-inbound-rtp" && r.kind === "audio") rin = r;
+				else if (r.type === "candidate-pair" && r.nominated && r.state === "succeeded") pair = r;
+				else if (r.type === "local-candidate" || r.type === "remote-candidate") cands[r.id] = r.candidateType;
+			});
+			var pv = prev[id] || {};
+			if (inb) {
+				var dRecv = (inb.packetsReceived || 0) - (pv.recv || 0);
+				var dLost = (inb.packetsLost || 0) - (pv.lost || 0);
+				var dConc = (inb.concealedSamples || 0) - (pv.conc || 0);
+				var dTot = (inb.totalSamplesReceived || 0) - (pv.tot || 0);
+				info.recv = {
+					lossPct: dRecv + dLost > 0 ? +(100 * dLost / (dRecv + dLost)).toFixed(1) : 0,
+					concealPct: dTot > 0 ? +(100 * dConc / dTot).toFixed(1) : 0,
+					jitterMs: inb.jitter != null ? Math.round(inb.jitter * 1000) : null,
+					bufferMs: inb.jitterBufferEmittedCount ? Math.round(1000 * inb.jitterBufferDelay / inb.jitterBufferEmittedCount) : null,
+					audioLevel: inb.audioLevel != null ? +inb.audioLevel.toFixed(3) : null,
+					kbps: Math.round(((inb.bytesReceived || 0) - (pv.bytesIn || 0)) * 8 / 10000),
+				};
+				prev[id] = { recv: inb.packetsReceived || 0, lost: inb.packetsLost || 0, conc: inb.concealedSamples || 0,
+					tot: inb.totalSamplesReceived || 0, bytesIn: inb.bytesReceived || 0, bytesOut: pv.bytesOut || 0 };
+			}
+			if (out) {
+				var pp = prev[id] || (prev[id] = {});
+				info.send = { kbps: Math.round(((out.bytesSent || 0) - (pv.bytesOut || 0)) * 8 / 10000), target: out.targetBitrate || null };
+				pp.bytesOut = out.bytesSent || 0;
+			}
+			if (rin) info.remote = { lossPct: rin.fractionLost != null ? +(100 * rin.fractionLost).toFixed(1) : null,
+				rttMs: rin.roundTripTime != null ? Math.round(rin.roundTripTime * 1000) : null };
+			if (pair) info.path = { rttMs: pair.currentRoundTripTime != null ? Math.round(pair.currentRoundTripTime * 1000) : null,
+				local: cands[pair.localCandidateId] || null, remote: cands[pair.remoteCandidateId] || null };
+			data.peers.push(info);
+		}).catch(function () { data.peers.push(info); });
+	});
+	Promise.all(jobs).then(function () {
+		if (V.ws && V.ws.readyState === 1) V.ws.send(JSON.stringify({ t: "diag", data: data }));
+	});
 }
 
 // ---------- Qualité de la voix (codec Opus) ----------
