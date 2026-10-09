@@ -142,16 +142,16 @@ var __voice = {
 };
 
 var __VOICE_MIN_THRESHOLD = 0.0025; // en dessous, c'est forcément du silence
-var __VOICE_VOICING_MIN = 0.55;     // à partir de quel "voisement" on considère que c'est une voix
+var __VOICE_VOICING_MIN = 0.45;     // à partir de quel "voisement" on considère que c'est une voix
 var __VOICE_STABILITY_MIN = 0.3;    // une voix garde un volume stable (un choc s'éteint vite)
-var __VOICE_NO_VOICE_CLOSE = 1200;  // ms sans voix (seulement des bruits) avant de fermer
+var __VOICE_NO_VOICE_CLOSE = 2500;  // ms sans voix (seulement des bruits) avant de fermer
 var __VOICE_DELAY = 0.15;           // retard du son envoyé (secondes)
 var __VOICE_TARGET_RMS = 0.07;      // volume visé pour la voix envoyée
 var __VOICE_MAX_GAIN = 1.5;         // petit complément seulement : c'est le navigateur qui règle le volume du micro
 
 var __VOICE_GATE_STEP = 20;     // on vérifie le volume toutes les 20 ms
-var __VOICE_GATE_ATTACK = 100;  // il faut 100 ms de voix continue pour ouvrir (un clic dure moins)
-var __VOICE_GATE_RELEASE = 450; // on ferme après 450 ms de silence (pour ne pas couper les fins de mots)
+var __VOICE_GATE_ATTACK = 60;   // il faut 60 ms de voix continue pour ouvrir (un clic dure moins)
+var __VOICE_GATE_RELEASE = 900; // on ferme après 900 ms de silence (pour ne pas hacher les phrases)
 
 // Serveurs STUN publics : ils aident les navigateurs à se trouver à travers les box internet
 var __VOICE_ICE = [
@@ -429,7 +429,7 @@ function __voice_gate_tick() {
 	// 2) Seuil : la voix doit dépasser nettement le bruit de fond.
 	//    Une fois ouvert, on tolère une voix un peu plus faible (fin de phrase).
 	var threshold = Math.max(__VOICE_MIN_THRESHOLD, V.floor * V.sensMult);
-	if (V.gateOpen) threshold *= 0.6;
+	if (V.gateOpen) threshold *= 0.45;
 
 	// 3) Volume automatique : on vise le même volume pour tout le monde
 	if (V.gateOpen && V.post && V.makeup) {
