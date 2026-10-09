@@ -25,6 +25,7 @@ const NAME_MAX = 16;
 const CHAT_MAX = 300;            // longueur max d'un message
 const JOIN_DELAY_MS = Number(process.env.JOIN_DELAY_MS ?? 0);    // décompte avant d'entrer dans une room (0 = direct)
 const MOVE_DELAY_MS = Number(process.env.MOVE_DELAY_MS ?? 2000); // décompte avant d'entrer dans une autre salle de la maison
+const ZONE_DELAY_MS = Number(process.env.ZONE_DELAY_MS ?? 1500); // décompte pour changer de coin dans la même salle
 const EMPTY_ROOM_TTL = 10 * 60 * 1000; // room supprimée après 10 min sans personne connecté
 
 /** @type {Map<string, Room>} */
@@ -295,6 +296,7 @@ const handlers = {
     const { room, player } = ctx;
     if (!zoneExists(msg.loc, msg.zone)) return;
     if (isNight(room)) return; // la nuit, on ne bouge pas
+    if (room.gathered) return; // rassemblement : tout le monde reste à la table
     cancelMove(player); // un nouveau clic remplace le déplacement en cours
     if (player.loc === msg.loc && player.zone === msg.zone) return;
 
@@ -304,25 +306,30 @@ const handlers = {
       room.broadcastPositions();
       updateVoice(room);
     };
-    // Même salle (autre zone) : immédiat. Autre salle : décompte de 2 s,
-    // pendant lequel on reste (et on entend) là où on était.
-    if (player.loc === msg.loc || MOVE_DELAY_MS <= 0) return placePlayer();
-    send(ws, "moving", { loc: msg.loc, zone: msg.zone, ms: MOVE_DELAY_MS });
-    // Les gens déjà dans la salle d'arrivée sont prévenus : "Untel arrive..."
+    // Décompte avant d'arriver, pendant lequel on reste (et on entend) là où on était :
+    //  - autre coin de la même salle : 1,5 s
+    //  - autre salle : 2 s
+    const sameRoom = player.loc === msg.loc;
+    const delay = sameRoom ? ZONE_DELAY_MS : MOVE_DELAY_MS;
+    if (delay <= 0) return placePlayer();
+    send(ws, "moving", { loc: msg.loc, zone: msg.zone, ms: delay });
+    // Autre salle : les gens déjà dans la salle d'arrivée sont prévenus ("Untel arrive...")
     player.moveWatchers = [];
-    for (const p of room.players.values()) {
-      if (p.isST || p === player || p.loc !== msg.loc) continue;
-      send(p.ws, "arriving", { id: player.id, name: player.name, ms: MOVE_DELAY_MS });
-      player.moveWatchers.push(p.ws);
+    if (!sameRoom) {
+      for (const p of room.players.values()) {
+        if (p.isST || p === player || p.loc !== msg.loc) continue;
+        send(p.ws, "arriving", { id: player.id, name: player.name, ms: delay });
+        player.moveWatchers.push(p.ws);
+      }
     }
     player.moveTimer = setTimeout(() => {
       player.moveTimer = null;
       player.moveWatchers = [];
-      if (!room.players.has(player.id) || room.phase === "lobby" || isNight(room)) {
+      if (!room.players.has(player.id) || room.phase === "lobby" || isNight(room) || room.gathered) {
         return send(player.ws, "moving_cancel");
       }
       placePlayer();
-    }, MOVE_DELAY_MS);
+    }, delay);
   },
 
   // Le Conteur règle son vocal : qui il écoute et à qui il parle

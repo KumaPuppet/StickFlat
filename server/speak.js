@@ -47,6 +47,12 @@ const stActions = {
   hands_down(ws, msg, room) {
     room.speakHands = msg.pid ? room.speakHands.filter(id => id !== msg.pid) : [];
   },
+  // Fin du rassemblement : les joueurs peuvent de nouveau aller dans la maison
+  end_gather(ws, msg, room) {
+    if (!room.gathered) return;
+    endGathering(room);
+    room.broadcast("announce", { text: "Fin du rassemblement : vous pouvez de nouveau circuler." });
+  },
 };
 
 const handlers = {};
