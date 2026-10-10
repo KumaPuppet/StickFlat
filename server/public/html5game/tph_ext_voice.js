@@ -142,16 +142,16 @@ var __voice = {
 };
 
 var __VOICE_MIN_THRESHOLD = 0.0025; // en dessous, c'est forcément du silence
-var __VOICE_VOICING_MIN = 0.45;     // à partir de quel "voisement" on considère que c'est une voix
+var __VOICE_VOICING_MIN = 0.55;     // à partir de quel "voisement" on considère que c'est une voix
 var __VOICE_STABILITY_MIN = 0.3;    // une voix garde un volume stable (un choc s'éteint vite)
-var __VOICE_NO_VOICE_CLOSE = 2500;  // ms sans voix (seulement des bruits) avant de fermer
+var __VOICE_NO_VOICE_CLOSE = 1200;  // ms sans voix (seulement des bruits) avant de fermer
 var __VOICE_DELAY = 0.15;           // retard du son envoyé (secondes)
 var __VOICE_TARGET_RMS = 0.07;      // volume visé pour la voix envoyée
-var __VOICE_MAX_GAIN = 1.5;         // petit complément seulement : c'est le navigateur qui règle le volume du micro
+var __VOICE_MAX_GAIN = 4;           // on peut monter un micro faible jusqu'à x4 (plus = souffle et grésillement)
 
 var __VOICE_GATE_STEP = 20;     // on vérifie le volume toutes les 20 ms
-var __VOICE_GATE_ATTACK = 60;   // il faut 60 ms de voix continue pour ouvrir (un clic dure moins)
-var __VOICE_GATE_RELEASE = 900; // on ferme après 900 ms de silence (pour ne pas hacher les phrases)
+var __VOICE_GATE_ATTACK = 100;  // il faut 100 ms de voix continue pour ouvrir (un clic dure moins)
+var __VOICE_GATE_RELEASE = 450; // on ferme après 450 ms de silence (pour ne pas couper les fins de mots)
 
 // Serveurs STUN publics : ils aident les navigateurs à se trouver à travers les box internet
 var __VOICE_ICE = [
@@ -175,12 +175,12 @@ function voice_start(url, code, token) {
 		V.stream = stream;
 		V.sendStream = stream;
 		try {
-			// On laisse le navigateur choisir la fréquence de la carte son : sur Chrome, imposer
-			// une autre fréquence l'oblige à tout convertir en continu (= craquements).
-			// "balanced" : un peu plus de marge que "interactive", donc moins de coupures sur les PC lents.
+			// Même fréquence que le micro : pas de conversion (source de craquements)
 			var AC = window.AudioContext || window.webkitAudioContext;
+			var rate = 0;
+			try { rate = stream.getAudioTracks()[0].getSettings().sampleRate || 0; } catch (e) {}
 			try {
-				V.ctx = new AC({ latencyHint: "balanced" });
+				V.ctx = rate ? new AC({ sampleRate: rate, latencyHint: "interactive" }) : new AC({ latencyHint: "interactive" });
 			} catch (e) {
 				V.ctx = new AC();
 			}
@@ -335,7 +335,6 @@ function __voice_build_chain(raw) {
 	V.post = { node: post, buf: new Float32Array(post.fftSize) };
 	V.makeup = makeup;
 	V.sendStream = dest.stream;
-	__voice_add_click_suppressor(ctx, delay);
 }
 
 // ---------- Anti-clic (pendant qu'on parle) ----------
@@ -494,7 +493,7 @@ function __voice_gate_tick() {
 	// 2) Seuil : la voix doit dépasser nettement le bruit de fond.
 	//    Une fois ouvert, on tolère une voix un peu plus faible (fin de phrase).
 	var threshold = Math.max(__VOICE_MIN_THRESHOLD, V.floor * V.sensMult);
-	if (V.gateOpen) threshold *= 0.45;
+	if (V.gateOpen) threshold *= 0.6;
 
 	// 3) Volume automatique : on vise le même volume pour tout le monde
 	if (V.gateOpen && V.post && V.makeup) {
@@ -625,11 +624,8 @@ function __voice_get_mic(deviceId) {
 	// autoGainControl désactivé : c'est notre propre volume automatique qui s'en charge
 	// (les deux ensemble se "battent" et font grésiller)
 	var V = __voice;
-	// autoGainControl activé : le réglage automatique du volume du navigateur (très bon sur Chrome)
-	// remonte les micros faibles ; le nôtre est réduit au minimum pour ne pas se battre avec lui.
-	// Pas de fréquence imposée : le micro garde la sienne (sinon conversion = craquements sur Chrome).
-	var base = { echoCancellation: V.echo, noiseSuppression: V.noise, autoGainControl: true,
-		channelCount: 1 };
+	var base = { echoCancellation: V.echo, noiseSuppression: V.noise, autoGainControl: false,
+		channelCount: 1, sampleRate: 48000 }; // qualité maximale du micro (48 kHz, mono)
 	var withDevice = {};
 	for (var k in base) withDevice[k] = base[k];
 	if (deviceId) withDevice.deviceId = { exact: deviceId };
