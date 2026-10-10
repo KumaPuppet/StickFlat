@@ -124,6 +124,9 @@ var __voice = {
 	volume: 1,          // volume des autres joueurs (0 à 1)
 	devices: { inputs: [], outputs: [] },
 	srcNode: null, chainInputs: [],
+	rnnoise: false,     // réduction de bruit par IA (RNNoise) demandée ?
+	rnnNode: null,      // le module RNNoise branché (null = pas branché)
+	rnnState: "off",    // "off", "loading", "on", "error", "unavailable"
 	// Filtre anti-bruits : on ne transmet que si le son dure (une voix) et dépasse
 	// nettement le bruit de fond du micro. Un clic ou une touche, trop courts, sont ignorés.
 	mode: "auto",
@@ -186,6 +189,7 @@ function voice_start(url, code, token) {
 			}
 			if (V.ctx.state === "suspended") V.ctx.resume();
 			__voice_build_chain(stream);
+			if (V.rnnoise) __voice_rnn_apply(); // réduction de bruit IA, si elle est activée
 		} catch (e) {
 			console.warn("[voice] traitement audio indisponible :", e);
 			V.ctx = null;
@@ -229,6 +233,8 @@ function voice_stop() {
 	V.makeup = null;
 	V.gateGain = null;
 	V.clickNode = null;
+	if (V.rnnNode) { try { V.rnnNode.port.postMessage("destroy"); } catch (e) {} V.rnnNode = null; }
+	V.rnnState = "off";
 	V.srcNode = null;
 	V.chainInputs = [];
 	V.sendStream = null;
@@ -702,7 +708,9 @@ function __voice_swap_mic() {
 			// On branche le nouveau micro au début de la chaîne de traitement
 			try { V.srcNode.disconnect(); } catch (e) {}
 			V.srcNode = V.ctx.createMediaStreamSource(stream);
-			V.chainInputs.forEach(function (n) { V.srcNode.connect(n); });
+			// Si RNNoise est branché, le nouveau micro passe par lui
+			if (V.rnnNode) V.srcNode.connect(V.rnnNode);
+			else V.chainInputs.forEach(function (n) { V.srcNode.connect(n); });
 		} else {
 			// Sans traitement audio : on remplace la piste envoyée à chaque joueur
 			V.sendStream = stream;
@@ -755,6 +763,82 @@ function voice_input_level() {
 	return V.localAnalyser ? __voice_level(V.localAnalyser) : 0;
 }
 
+// ---------- Réduction de bruit par IA (RNNoise) ----------
+// Un petit réseau de neurones reconnaît la voix humaine et enlève le reste,
+// même pendant qu'on parle (clics, clavier, ventilateur...).
+// Fichiers hébergés par notre serveur : /rnnoise/ (bibliothèque @sapphi-red/web-noise-suppressor, MIT).
+// RNNoise fonctionne à 48 kHz : sur une autre fréquence, l'option est indisponible.
+var __VOICE_RNN_ID = "@sapphi-red/web-noise-suppressor/rnnoise";
+var __voiceRnnWasm = null;     // le moteur RNNoise, téléchargé une seule fois
+var __voiceRnnModuleCtx = null; // AudioContext dans lequel le module est déjà chargé
+
+function voice_set_rnnoise(on) {
+	var V = __voice;
+	V.rnnoise = !!on;
+	if (V.state === "ready") __voice_rnn_apply();
+	return 1;
+}
+
+// "off", "loading", "on", "error", "unavailable"
+function voice_rnnoise_state() {
+	return __voice.rnnState;
+}
+
+function __voice_rnn_url(name) {
+	return new URL("rnnoise/" + name, document.baseURI).href;
+}
+
+function __voice_rnn_apply() {
+	var V = __voice;
+	if (!V.ctx || !V.srcNode) { V.rnnState = V.rnnoise ? "unavailable" : "off"; return; }
+	// Désactivation : on débranche RNNoise et on reconnecte le micro directement
+	if (!V.rnnoise) {
+		if (V.rnnNode) {
+			try { V.srcNode.disconnect(); } catch (e) {}
+			try { V.rnnNode.disconnect(); V.rnnNode.port.postMessage("destroy"); } catch (e) {}
+			V.rnnNode = null;
+			V.chainInputs.forEach(function (n) { V.srcNode.connect(n); });
+		}
+		V.rnnState = "off";
+		return;
+	}
+	if (V.rnnNode || V.rnnState === "loading") return;
+	if (V.ctx.sampleRate !== 48000 || !V.ctx.audioWorklet || typeof AudioWorkletNode === "undefined") {
+		V.rnnState = "unavailable";
+		return;
+	}
+	V.rnnState = "loading";
+	var ctx = V.ctx;
+	var simd = false;
+	try {
+		simd = WebAssembly.validate(new Uint8Array([0, 97, 115, 109, 1, 0, 0, 0, 1, 5, 1, 96, 0, 1, 123, 3, 2, 1, 0, 10, 10, 1, 8, 0, 65, 0, 253, 15, 253, 98, 11]));
+	} catch (e) {}
+	var wasmP = __voiceRnnWasm ? Promise.resolve(__voiceRnnWasm)
+		: fetch(__voice_rnn_url(simd ? "rnnoise_simd.wasm" : "rnnoise.wasm")).then(function (r) {
+			if (!r.ok) throw new Error("rnnoise.wasm : " + r.status);
+			return r.arrayBuffer();
+		}).then(function (b) { __voiceRnnWasm = b; return b; });
+	var modP = (__voiceRnnModuleCtx === ctx) ? Promise.resolve()
+		: ctx.audioWorklet.addModule(__voice_rnn_url("workletProcessor.js")).then(function () { __voiceRnnModuleCtx = ctx; });
+	Promise.all([wasmP, modP]).then(function (res) {
+		if (V.ctx !== ctx || !V.srcNode || !V.rnnoise) { V.rnnState = V.rnnoise ? "error" : "off"; return; }
+		var node = new AudioWorkletNode(ctx, __VOICE_RNN_ID, {
+			processorOptions: { maxChannels: 1, wasmBinary: res[0].slice(0) },
+			channelCount: 1, channelCountMode: "explicit", outputChannelCount: [1],
+		});
+		// Micro -> RNNoise -> (détection, analyse de la voix, envoi)
+		try { V.srcNode.disconnect(); } catch (e) {}
+		V.srcNode.connect(node);
+		V.chainInputs.forEach(function (n) { node.connect(n); });
+		V.rnnNode = node;
+		V.rnnState = "on";
+		V.floor = 0; V.learnMs = 0; // le bruit de fond change : on le remesure
+	}).catch(function (err) {
+		console.warn("[voice] RNNoise indisponible :", err);
+		V.rnnState = "error";
+	});
+}
+
 // ---------- Diagnostic (mesures techniques envoyées au serveur, jamais le son) ----------
 
 function __voice_browser() {
@@ -785,7 +869,7 @@ function __voice_diag_send() {
 			agc: settings.autoGainControl, echo: settings.echoCancellation, noise: settings.noiseSuppression,
 		},
 		ctx: V.ctx ? { rate: V.ctx.sampleRate, state: V.ctx.state, base: V.ctx.baseLatency, out: V.ctx.outputLatency } : null,
-		settings: { micOn: V.micOn, mode: V.mode, sensMult: V.sensMult, volume: V.volume, echo: V.echo, noise: V.noise },
+		settings: { micOn: V.micOn, mode: V.mode, sensMult: V.sensMult, volume: V.volume, echo: V.echo, noise: V.noise, rnnoise: V.rnnState },
 		gate: {
 			ticks: dg.n || 0,
 			levelAvg: +((dg.lvSum || 0) / n).toFixed(4), levelMax: +(dg.lvMax || 0).toFixed(4),
