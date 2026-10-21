@@ -8,9 +8,9 @@ param([switch]$SansEnvoi)
 $ErrorActionPreference = "Stop"
 
 $Racine  = $PSScriptRoot
-$Projet  = "C:\Users\Slymane\GameMakerProjects\blood on the clecktower\blood on the clecktower.yyp"
+$Projet  = "C:\Users\Slymane\GameMakerProjects\stickflat\stickflat.yyp"
 $Public  = Join-Path $Racine "server\public"
-$Travail = Join-Path $env:TEMP "blood-on-the-moon-build"
+$Travail = Join-Path $env:TEMP "stickflat-build"
 $Sortie  = Join-Path $Travail "out"
 
 # Runtime GameMaker le plus recent, et dossier utilisateur (celui qui contient la licence)
@@ -26,10 +26,13 @@ Write-Host ""
 Write-Host "1/3  Construction du jeu (HTML5)..." -ForegroundColor Yellow
 if (Test-Path $Sortie) { Remove-Item $Sortie -Recurse -Force }
 New-Item -ItemType Directory -Force $Sortie | Out-Null
+# La conversion des sons ecrit sur stderr : ce n'est pas une erreur (la verification est faite juste apres)
+$ErrorActionPreference = "Continue"
 & $Igor -j=8 --project="$Projet" --rp="$($Runtime.FullName)" --uf="$($User.FullName)" `
 	--temp="$Travail\temp" --cache="$Travail\cache" --of="$Sortie\index.html" -- HTML5 folder 2>&1 |
 	Where-Object { $_ -match "error|Error|ERROR" -and $_ -notmatch "CreateDirectory|ArgumentException|at System|at Igor|empty string" } |
 	ForEach-Object { Write-Host "  $_" -ForegroundColor Red }
+$ErrorActionPreference = "Stop"
 if (-not (Test-Path (Join-Path $Sortie "index.html")) -or -not (Test-Path (Join-Path $Sortie "html5game"))) {
 	throw "La construction a echoue (pas de index.html). Ouvre le projet dans GameMaker pour voir l'erreur."
 }
@@ -48,4 +51,4 @@ git push origin main
 if ($LASTEXITCODE -ne 0) { throw "L'envoi sur GitHub a echoue." }
 Write-Host ""
 Write-Host "C'est envoye ! Le site sera a jour dans quelques minutes :" -ForegroundColor Green
-Write-Host "https://blood-on-the-moon.onrender.com"
+Write-Host "https://stickflat.onrender.com"

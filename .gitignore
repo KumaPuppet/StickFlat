@@ -6,3 +6,8 @@ node_modules/
 Thumbs.db
 *.log
 sauvegarde-gml/
+
+# Hors du site en ligne
+Stickflat/
+output/
+.claude/

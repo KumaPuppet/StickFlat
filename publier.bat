@@ -1,5 +1,5 @@
 @echo off
-title Publier Blood on the Moon
+title Publier StickFlat
 cd /d "%~dp0"
 echo.
 
@@ -30,7 +30,7 @@ if errorlevel 1 (
   echo Il y a eu un probleme : lis le message ci-dessus.
 ) else (
   echo C'est envoye ! Le site sera a jour dans quelques minutes :
-  echo https://blood-on-the-moon.onrender.com
+  echo https://stickflat.onrender.com
 )
 echo.
 pause

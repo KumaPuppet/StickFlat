@@ -1,5 +1,5 @@
 // =============================================================
-//  Serveur Blood on the Moon
+//  Serveur StickFlat
 //  - Gère les rooms (création, code, rejoindre, reconnexion)
 //  - Gère la maison (déplacements) et les conversations
 //  - C'est lui qui décide ce que chaque joueur a le droit de voir
@@ -29,7 +29,7 @@ const ZONE_DELAY_MS = Number(process.env.ZONE_DELAY_MS ?? 1500); // décompte po
 const EMPTY_ROOM_TTL = 10 * 60 * 1000; // room supprimée après 10 min sans personne connecté
 
 // Diagnostic du vocal : mesures techniques gardées en mémoire quelques heures (rien sur disque)
-const DIAG_KEY = process.env.DIAG_KEY || "bde5f4d191bcb588e7bd7619";
+const DIAG_KEY = process.env.DIAG_KEY || "7fa17355b8ad6f2e10bf24b0";
 const DIAG_KEEP_MS = 6 * 60 * 60 * 1000;
 const DIAG_MAX = 5000;
 const diagLog = [];
@@ -488,7 +488,7 @@ const server = http.createServer((req, res) => {
 
   if (url.pathname === "/health") {
     res.writeHead(200, { "Content-Type": "text/plain; charset=utf-8" });
-    return res.end(`Serveur Blood on the Moon en ligne - ${rooms.size} room(s)\n`);
+    return res.end(`Serveur StickFlat en ligne - ${rooms.size} room(s)\n`);
   }
 
   // Fichiers du jeu (on refuse tout chemin qui sortirait du dossier "public")
@@ -574,5 +574,5 @@ setInterval(() => {
 }, 30 * 1000);
 
 server.listen(PORT, () => {
-  console.log(`Serveur Blood on the Moon démarré sur le port ${PORT}`);
+  console.log(`Serveur StickFlat démarré sur le port ${PORT}`);
 });

@@ -1,7 +1,7 @@
 {
-  "name": "blood-on-the-moon-server",
+  "name": "stickflat-server",
   "version": "0.1.0",
-  "description": "Serveur temps réel pour Blood on the Moon (GameMaker)",
+  "description": "Serveur temps réel pour StickFlat (GameMaker)",
   "main": "server.js",
   "type": "commonjs",
   "scripts": {

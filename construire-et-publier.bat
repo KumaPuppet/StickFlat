@@ -1,5 +1,5 @@
 @echo off
-title Construire et publier Blood on the Moon
+title Construire et publier StickFlat
 echo.
 echo Pense a enregistrer ton projet dans GameMaker (Ctrl+S) avant de continuer.
 echo.

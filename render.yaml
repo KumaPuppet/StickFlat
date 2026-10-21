@@ -2,7 +2,7 @@
 # ET distribue le jeu (dossier server/public).
 services:
   - type: web
-    name: blood-on-the-moon
+    name: stickflat
     runtime: node
     plan: free
     rootDir: server

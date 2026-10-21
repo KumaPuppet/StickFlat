@@ -1,5 +1,5 @@
 // =============================================================
-//  ext_voice : vocal par zone pour Blood on the Moon (HTML5)
+//  ext_voice : vocal par zone pour StickFlat (HTML5)
 //
 //  Ce fichier tourne dans le navigateur, à côté du jeu GameMaker.
 //  - Il demande l'accès au micro.
@@ -30,7 +30,7 @@ try {
 
 // ---------- Fonctions "page web" (adresse du site, lien d'invitation) ----------
 
-// Nom du site qui affiche le jeu, ex : "botc-xxx.onrender.com"
+// Nom du site qui affiche le jeu, ex : "stickflat.onrender.com"
 function web_page_host() {
 	return window.location.hostname;
 }
@@ -47,7 +47,7 @@ function web_page_secure() {
 	return window.location.protocol === "https:" ? 1 : 0;
 }
 
-// Adresse de la page sans les paramètres, ex : "https://botc-xxx.onrender.com/"
+// Adresse de la page sans les paramètres, ex : "https://stickflat.onrender.com/"
 function web_page_base() {
 	return window.location.origin + window.location.pathname;
 }
@@ -1082,3 +1082,6 @@ function __voice_level(a) {
 	}
 	return Math.min(1, Math.sqrt(sum / a.buf.length) * 4);
 }
+
+// Le clic droit sert à parer : on empêche le menu du navigateur de s'ouvrir sur le jeu
+document.addEventListener("contextmenu", function (e) { e.preventDefault(); });
