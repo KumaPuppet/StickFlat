@@ -5,6 +5,7 @@ services:
     name: stickflat
     runtime: node
     plan: free
+    region: frankfurt   # serveur en Europe : ~20 ms au lieu de ~160 ms (Oregon par défaut)
     rootDir: server
     buildCommand: npm install
     startCommand: npm start
