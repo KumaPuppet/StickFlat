@@ -230,7 +230,8 @@ const handlers = {
     if (!ctx || ctx.room.phase !== "match" || ctx.player.id !== ctx.room.hostId) return;
     for (const p of ctx.room.players.values()) {
       // Pas de file d'attente : si un joueur a une connexion lente, on saute des images
-      if (p !== ctx.player && p.ws && p.ws.readyState === p.ws.OPEN && p.ws.bufferedAmount < 256 * 1024) p.ws.send(text);
+      // (mieux vaut sauter une image que tout afficher avec une seconde de retard)
+      if (p !== ctx.player && p.ws && p.ws.readyState === p.ws.OPEN && p.ws.bufferedAmount < SNAP_BACKLOG) p.ws.send(text);
     }
   },
 };
@@ -277,7 +278,20 @@ const MIME = {
 const INDEX_FILE = path.join(PUBLIC_DIR, "index.html");
 const WINDOWS_EXE = path.join(PUBLIC_DIR, "telechargement", "StickFlat-Windows.exe");
 // Même couleur que PAPER dans le jeu (scr_sketch), sans barres de défilement
-const PAGE_STYLE = `<style>html, body { background: #f4eddc !important; overflow: hidden; }</style>\n`;
+// Le canvas est lissé (GameMaker le met en "pixels carrés" quand il est agrandi : jeu pixelisé),
+// et les traits sont anticrénelés : GameMaker crée son contexte WebGL avec antialias:false,
+// on le force à true avant que le jeu démarre (les stickmen ne sont que des traits fins).
+const PAGE_STYLE = `<style>html, body { background: #f4eddc !important; overflow: hidden; }
+canvas { image-rendering: auto !important; -webkit-interpolation-mode: bicubic !important; }</style>
+<script>(function () {
+  var get = HTMLCanvasElement.prototype.getContext;
+  HTMLCanvasElement.prototype.getContext = function (type, opts) {
+    if (type === "webgl" || type === "webgl2" || type === "experimental-webgl") opts = Object.assign({}, opts || {}, { antialias: true });
+    return get.call(this, type, opts);
+  };
+})();</script>\n`;
+// Retard max d'images de l'arène en attente pour un invité (au-delà, on saute des images)
+const SNAP_BACKLOG = 48 * 1024;
 const DOWNLOAD_BUTTON = `
 <div id="dl-win" style="position:fixed;left:10px;bottom:10px;z-index:10;font:13px sans-serif;display:flex;gap:4px">
   <a href="/telechargement/StickFlat-Windows.exe" download
@@ -330,8 +344,17 @@ const server = http.createServer((req, res) => {
   });
 });
 
-// Les images de l'arène (snap) peuvent être grosses : 1 Mo maximum par message
-const wss = new WebSocketServer({ server, maxPayload: 1024 * 1024 });
+// Les images de l'arène (snap) peuvent être grosses : 1 Mo maximum par message.
+// Compression (permessage-deflate) : une image JSON de ~10 Ko n'en fait plus que ~2. Le navigateur
+// la propose et décompresse tout seul ; un client qui ne la propose pas reçoit du texte normal.
+const wss = new WebSocketServer({
+  server,
+  maxPayload: 1024 * 1024,
+  perMessageDeflate: {
+    threshold: 512,                    // les petits messages (commandes des joueurs) partent tels quels
+    zlibDeflateOptions: { level: 3 },  // rapide : ~30 images par seconde et par joueur
+  },
+});
 
 wss.on("connection", ws => {
   ws.ctx = null;
