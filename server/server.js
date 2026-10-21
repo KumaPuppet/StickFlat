@@ -1,8 +1,10 @@
 // =============================================================
 //  Serveur StickFlat
-//  - Gère les rooms (création, code, rejoindre, reconnexion)
-//  - Gère la maison (déplacements) et les conversations
-//  - C'est lui qui décide ce que chaque joueur a le droit de voir
+//  - Distribue le jeu (dossier "public", export HTML5 de GameMaker)
+//  - Gère les rooms en ligne : création avec un code, rejoindre, reconnexion
+//  - Pendant un combat, il ne calcule rien : le jeu de l'hôte (celui qui a créé
+//    la room) fait tourner l'arène. Le serveur relaie les commandes des autres
+//    joueurs vers l'hôte ("in"), et les images de l'arène de l'hôte vers les autres ("snap").
 //  Protocole : chaque message est un objet JSON avec un champ "t" (type)
 // =============================================================
 const http = require("http");
@@ -10,29 +12,14 @@ const fs = require("fs");
 const path = require("path");
 const crypto = require("crypto");
 const { WebSocketServer } = require("ws");
-const { LOCATIONS, START, zoneExists, cancelMove } = require("./house");
-const { updateVoice } = require("./voice");
-const { grimHandlers, sendGrimoire, publicInfo, onWelcome, ROLES, REMINDERS } = require("./grimoire");
-const { phaseHandlers, isNight } = require("./phases");
-const { voteHandlers, publicVotes, stopVote, gameOverData } = require("./votes");
-const { speakHandlers, resetSpeak } = require("./speak");
 
 const PORT = process.env.PORT || 3000;
-const MAX_PLAYERS = 20;          // 15 joueurs + 5 voyageurs
-// Nombre minimum de joueurs pour lancer (1 pour tester seul, 5 pour une vraie partie)
-const MIN_PLAYERS = Number(process.env.MIN_PLAYERS || 1);
+const MAX_PLAYERS = 4;
+// Nombre minimum de joueurs pour lancer un combat (1 pour tester seul, 2 pour un vrai combat)
+const MIN_PLAYERS = Number(process.env.MIN_PLAYERS || 2);
 const NAME_MAX = 16;
-const CHAT_MAX = 300;            // longueur max d'un message
-const JOIN_DELAY_MS = Number(process.env.JOIN_DELAY_MS ?? 0);    // décompte avant d'entrer dans une room (0 = direct)
-const MOVE_DELAY_MS = Number(process.env.MOVE_DELAY_MS ?? 2000); // décompte avant d'entrer dans une autre salle de la maison
-const ZONE_DELAY_MS = Number(process.env.ZONE_DELAY_MS ?? 1500); // décompte pour changer de coin dans la même salle
+const CHAR_MAX = 24;
 const EMPTY_ROOM_TTL = 10 * 60 * 1000; // room supprimée après 10 min sans personne connecté
-
-// Diagnostic du vocal : mesures techniques gardées en mémoire quelques heures (rien sur disque)
-const DIAG_KEY = process.env.DIAG_KEY || "7fa17355b8ad6f2e10bf24b0";
-const DIAG_KEEP_MS = 6 * 60 * 60 * 1000;
-const DIAG_MAX = 5000;
-const diagLog = [];
 
 /** @type {Map<string, Room>} */
 const rooms = new Map();
@@ -57,107 +44,79 @@ function cleanText(text, max) {
   return text.replace(/[\x00-\x1f]/g, "").trim().slice(0, max);
 }
 
+function cleanChar(id) {
+  const c = cleanText(id, CHAR_MAX);
+  return /^[a-z_]+$/.test(c) ? c : "knight";
+}
+
 function send(ws, type, data = {}) {
-  if (ws && ws.readyState === ws.OPEN) {
-    ws.send(JSON.stringify({ t: type, ...data }));
-  }
+  if (ws && ws.readyState === ws.OPEN) ws.send(JSON.stringify({ t: type, ...data }));
 }
 
 // ---------- Rooms ----------
 class Room {
   constructor(code) {
     this.code = code;
-    this.phase = "lobby";
-    this.storytellerId = null;
-    /** @type {Map<string, Player>} */
-    this.players = new Map();
+    this.phase = "lobby"; // "lobby" (choix des persos) ou "match" (combat en cours)
+    this.hostId = null;
+    /** @type {Map<string, object>} */
+    this.players = new Map(); // dans l'ordre d'arrivée = place dans l'arène
     this.emptySince = null;
-    this.stTalk = "none";   // vocal du Conteur : "none", "all" ou id d'un joueur
-    this.stListen = "none"; // écoute du Conteur : "none", "all" ou "lieu/zone"
-    this.pending = [];      // joueurs en train d'arriver (décompte de 2 secondes)
-    resetSpeak(this);       // micros coupés, mains levées (voir speak.js)
   }
 
-  addPlayer(name, ws, isST) {
-    const player = {
-      id: makeId(), token: makeId() + makeId(), name, ws, isST, connected: true,
-      loc: START.loc, zone: START.zone, lastChat: 0,
-      voiceWs: null, voiceSid: null, // connexion vocale (séparée de la connexion du jeu)
-    };
+  addPlayer(name, char, ws) {
+    const player = { id: makeId(), token: makeId() + makeId(), name, char, ws, connected: true };
     this.players.set(player.id, player);
-    if (isST) this.storytellerId = player.id;
+    if (!this.hostId) this.hostId = player.id;
     return player;
   }
 
-  storyteller() {
-    return this.players.get(this.storytellerId);
+  host() {
+    return this.players.get(this.hostId);
   }
 
   nameTaken(name) {
     const lower = name.toLowerCase();
     for (const p of this.players.values()) if (p.name.toLowerCase() === lower) return true;
-    for (const p of this.pending) if (p.name.toLowerCase() === lower) return true;
     return false;
-  }
-
-  // Ce que tout le monde voit de la liste des joueurs (aucune info secrète ici)
-  publicPlayers() {
-    return [...this.players.values()].map(p => ({
-      id: p.id, name: p.name, isST: p.isST, connected: p.connected,
-      ...publicInfo(this, p.id), // vivant/mort et place autour de la table
-    }));
-  }
-
-  // Qui est où, du point de vue de "viewer" (le Conteur n'a pas de position) :
-  //  - le Conteur voit tout le monde
-  //  - un joueur ne voit que les gens de sa salle (on ne sait pas qui est au jardin depuis le salon)
-  positionsFor(viewer) {
-    const pos = {};
-    const seeAll = !viewer || viewer.isST;
-    for (const p of this.players.values()) {
-      if (p.isST) continue;
-      if (seeAll || p === viewer || p.loc === viewer.loc) pos[p.id] = { loc: p.loc, zone: p.zone };
-    }
-    return pos;
-  }
-
-  broadcast(type, data) {
-    for (const p of this.players.values()) send(p.ws, type, data);
-  }
-
-  broadcastPlayers() {
-    this.broadcast("players", { players: this.publicPlayers() });
-  }
-
-  // Chaque joueur reçoit SA version des positions
-  broadcastPositions() {
-    for (const p of this.players.values()) send(p.ws, "positions", { positions: this.positionsFor(p) });
-  }
-
-  welcome(player) {
-    send(player.ws, "welcome", {
-      code: this.code,
-      token: player.token,
-      you: { id: player.id, name: player.name, isST: player.isST },
-      phase: this.phase,
-      players: this.publicPlayers(),
-      locations: LOCATIONS,
-      positions: this.positionsFor(player),
-      roles: ROLES,
-      reminders: REMINDERS,
-      started: !!this.started,                                    // partie lancée ?
-      elapsed: this.started ? Date.now() - this.startedAt : 0,   // temps écoulé (ms)
-      time: this.time || { kind: "setup", n: 0 },               // jour / nuit
-      votes: publicVotes(this),                                    // nominations du jour
-      gameOver: this.ended ? gameOverData(this) : null,           // partie terminée ?
-    });
-    onWelcome(this, player);
   }
 
   connectedCount() {
     let n = 0;
     for (const p of this.players.values()) if (p.connected) n++;
     return n;
+  }
+
+  publicPlayers() {
+    return [...this.players.values()].map(p => ({ id: p.id, name: p.name, char: p.char, connected: p.connected }));
+  }
+
+  broadcast(type, data, except = null) {
+    for (const p of this.players.values()) if (p !== except) send(p.ws, type, data);
+  }
+
+  broadcastPlayers() {
+    this.broadcast("players", { players: this.publicPlayers(), hostId: this.hostId });
+  }
+
+  welcome(player) {
+    send(player.ws, "welcome", {
+      code: this.code,
+      token: player.token,
+      you: { id: player.id, name: player.name },
+      hostId: this.hostId,
+      phase: this.phase,
+      players: this.publicPlayers(),
+    });
+  }
+
+  // Combat fini (ou interrompu) : tout le monde revient au choix des personnages
+  toLobby(info = "") {
+    this.phase = "lobby";
+    // Ceux qui ont été déconnectés pendant le combat libèrent leur place
+    for (const p of [...this.players.values()]) if (!p.connected && p.id !== this.hostId) this.players.delete(p.id);
+    this.broadcast("lobby", { info });
+    this.broadcastPlayers();
   }
 }
 
@@ -170,14 +129,14 @@ function findByToken(code, token) {
 
 // ---------- Traitement des messages ----------
 const handlers = {
-  // Créer une room : le créateur devient le Conteur
+  // Créer une room : le créateur devient l'hôte (c'est son jeu qui fera tourner l'arène)
   create(ws, msg) {
     const name = cleanText(msg.name, NAME_MAX);
     if (!name) return send(ws, "error", { msg: "Choisis un pseudo." });
     leaveCurrentRoom(ws);
     const room = new Room(makeRoomCode());
     rooms.set(room.code, room);
-    const player = room.addPlayer(name, ws, true);
+    const player = room.addPlayer(name, cleanChar(msg.char), ws);
     ws.ctx = { room, player };
     room.welcome(player);
     console.log(`[${room.code}] créée par ${name}`);
@@ -188,38 +147,20 @@ const handlers = {
     const name = cleanText(msg.name, NAME_MAX);
     const code = String(msg.code || "").toUpperCase().trim();
     if (!name) return send(ws, "error", { msg: "Choisis un pseudo." });
+    if (!/^[A-Z]{4}$/.test(code)) return send(ws, "error", { msg: "Le code fait 4 lettres." });
     const room = rooms.get(code);
     if (!room) return send(ws, "error", { msg: `La room ${code} n'existe pas.` });
-    if (room.phase !== "lobby") return send(ws, "error", { msg: "La partie a déjà commencé." });
-    if (room.players.size + room.pending.length >= MAX_PLAYERS + 1) return send(ws, "error", { msg: "La room est pleine." });
+    if (ws.ctx && ws.ctx.room === room) return room.welcome(ws.ctx.player);
+    if (room.phase !== "lobby") return send(ws, "error", { msg: "Un combat est en cours dans cette room : attends la fin." });
+    if (room.players.size >= MAX_PLAYERS) return send(ws, "error", { msg: `La room est pleine (${MAX_PLAYERS} joueurs).` });
     if (room.nameTaken(name)) return send(ws, "error", { msg: "Ce pseudo est déjà pris dans cette room." });
-    if (ws.pendingJoin) return; // déjà en train d'entrer quelque part
     leaveCurrentRoom(ws);
-
-    // Décompte avant d'entrer : le joueur et ceux déjà présents le voient
-    const pend = { name, ws, timer: null };
-    room.pending.push(pend);
-    ws.pendingJoin = { room, pend };
-    send(ws, "joining", { code: room.code, ms: JOIN_DELAY_MS });
-    room.broadcast("incoming", { name, ms: JOIN_DELAY_MS });
-
-    pend.timer = setTimeout(() => {
-      room.pending = room.pending.filter(x => x !== pend);
-      ws.pendingJoin = null;
-      if (ws.readyState !== ws.OPEN) return;
-      if (rooms.get(room.code) !== room || room.phase !== "lobby") {
-        room.broadcast("incoming_cancel", { name });
-        return send(ws, "error", { msg: "Impossible d'entrer : la partie a commencé." });
-      }
-      const player = room.addPlayer(name, ws, false);
-      ws.ctx = { room, player };
-      room.emptySince = null;
-      room.welcome(player);
-      room.broadcastPlayers();
-      room.broadcastPositions();
-      updateVoice(room);
-      console.log(`[${room.code}] ${name} a rejoint`);
-    }, JOIN_DELAY_MS);
+    const player = room.addPlayer(name, cleanChar(msg.char), ws);
+    ws.ctx = { room, player };
+    room.emptySince = null;
+    room.welcome(player);
+    room.broadcastPlayers();
+    console.log(`[${room.code}] ${name} a rejoint`);
   },
 
   // Revenir dans sa room après une coupure ou un rechargement de page
@@ -235,32 +176,11 @@ const handlers = {
     player.connected = true;
     ws.ctx = { room, player };
     room.emptySince = null;
+    // L'hôte a rechargé sa page pendant un combat : l'arène est perdue, retour au choix des persos
+    if (room.phase === "match" && player.id === room.hostId) room.toLobby("L'hôte s'est reconnecté : nouveau combat.");
     room.welcome(player);
     room.broadcastPlayers();
-    updateVoice(room);
     console.log(`[${room.code}] ${player.name} est revenu`);
-  },
-
-  // Le Conteur renvoie tout le monde au lobby (après une partie, pour en rejouer une)
-  back_to_lobby(ws) {
-    const ctx = ws.ctx;
-    if (!ctx || !ctx.player.isST || ctx.room.phase === "lobby") return;
-    const room = ctx.room;
-    stopVote(room);
-    room.phase = "lobby";
-    room.started = false;
-    room.ended = null;
-    room.grim = null;
-    room.day = null;
-    room.time = { kind: "setup", n: 0 };
-    room.stTalk = "none";
-    room.stListen = "none";
-    resetSpeak(room);
-    room.broadcast("phase", { phase: room.phase });
-    room.broadcast("clock", { started: false, elapsed: 0 });
-    room.broadcastPlayers();
-    updateVoice(room);
-    console.log(`[${room.code}] retour au lobby`);
   },
 
   // Quitter volontairement la room
@@ -269,193 +189,75 @@ const handlers = {
     send(ws, "left");
   },
 
-  // Le Conteur lance la partie : tout le monde arrive sur la place
+  // Changer de personnage (dans le lobby)
+  char(ws, msg) {
+    const ctx = ws.ctx;
+    if (!ctx || ctx.room.phase !== "lobby") return;
+    ctx.player.char = cleanChar(msg.char);
+    ctx.room.broadcastPlayers();
+  },
+
+  // L'hôte lance le combat
   start(ws) {
     const ctx = ws.ctx;
-    if (!ctx || !ctx.player.isST || ctx.room.phase !== "lobby") return;
+    if (!ctx || ctx.player.id !== ctx.room.hostId || ctx.room.phase !== "lobby") return;
     const room = ctx.room;
-    const count = room.players.size - 1;
-    if (count < MIN_PLAYERS) {
-      return send(ws, "error", { msg: `Il faut au moins ${MIN_PLAYERS} joueur(s) en plus du Conteur.` });
-    }
-    room.phase = "game";
-    room.stTalk = "none";
-    room.stListen = "none";
-    resetSpeak(room);
-    room.grim = null; // les rôles seront distribués par le Conteur
-    room.started = false; // puis il lancera la partie (rôles révélés + chronomètre)
-    room.time = { kind: "setup", n: 0 };
-    room.seats = [];
-    for (const p of room.players.values()) { cancelMove(p); p.loc = START.loc; p.zone = START.zone; }
-    room.broadcastPositions();
-    room.broadcast("phase", { phase: room.phase });
-    sendGrimoire(room);   // fixe aussi l'ordre des places
-    room.broadcastPlayers();
-    updateVoice(room);
-    console.log(`[${room.code}] préparation lancée (${count} joueurs)`);
+    const count = room.connectedCount();
+    if (count < MIN_PLAYERS) return send(ws, "error", { msg: `Il faut au moins ${MIN_PLAYERS} joueurs pour lancer.` });
+    room.phase = "match";
+    room.broadcast("start", { players: room.publicPlayers().filter(p => p.connected), hostId: room.hostId });
+    console.log(`[${room.code}] combat lancé (${count} joueurs)`);
   },
 
-  // Un joueur se déplace dans une zone de la maison
-  move(ws, msg) {
+  // L'hôte arrête le combat : retour au choix des personnages
+  lobby(ws) {
     const ctx = ws.ctx;
-    if (!ctx || ctx.player.isST || ctx.room.phase === "lobby") return;
-    const { room, player } = ctx;
-    if (!zoneExists(msg.loc, msg.zone)) return;
-    if (isNight(room)) return; // la nuit, on ne bouge pas
-    if (room.gathered) return; // rassemblement : tout le monde reste à la table
-    cancelMove(player); // un nouveau clic remplace le déplacement en cours
-    if (player.loc === msg.loc && player.zone === msg.zone) return;
-
-    const placePlayer = () => {
-      player.loc = msg.loc;
-      player.zone = msg.zone;
-      room.broadcastPositions();
-      updateVoice(room);
-    };
-    // Décompte avant d'arriver, pendant lequel on reste (et on entend) là où on était :
-    //  - autre coin de la même salle : 1,5 s
-    //  - autre salle : 2 s
-    const sameRoom = player.loc === msg.loc;
-    const delay = sameRoom ? ZONE_DELAY_MS : MOVE_DELAY_MS;
-    if (delay <= 0) return placePlayer();
-    send(ws, "moving", { loc: msg.loc, zone: msg.zone, ms: delay });
-    // Autre salle : les gens déjà dans la salle d'arrivée sont prévenus ("Untel arrive...")
-    player.moveWatchers = [];
-    if (!sameRoom) {
-      for (const p of room.players.values()) {
-        if (p.isST || p === player || p.loc !== msg.loc) continue;
-        send(p.ws, "arriving", { id: player.id, name: player.name, ms: delay });
-        player.moveWatchers.push(p.ws);
-      }
-    }
-    player.moveTimer = setTimeout(() => {
-      player.moveTimer = null;
-      player.moveWatchers = [];
-      if (!room.players.has(player.id) || room.phase === "lobby" || isNight(room) || room.gathered) {
-        return send(player.ws, "moving_cancel");
-      }
-      placePlayer();
-    }, delay);
+    if (!ctx || ctx.player.id !== ctx.room.hostId || ctx.room.phase !== "match") return;
+    ctx.room.toLobby();
   },
 
-  // Le Conteur règle son vocal : qui il écoute et à qui il parle
-  st_voice(ws, msg) {
+  // Commandes d'un joueur (clavier, souris, choix de bonus) : envoyées à l'hôte
+  in(ws, msg) {
     const ctx = ws.ctx;
-    if (!ctx || !ctx.player.isST) return;
-    const room = ctx.room;
-    const listen = String(msg.listen || "none");
-    const talk = String(msg.talk || "none");
-    const [loc, zone] = listen.split("/");
-    if (listen === "none" || listen === "all" || zoneExists(loc, zone)) room.stListen = listen;
-    const target = room.players.get(talk);
-    if (talk === "none" || talk === "all" || (target && !target.isST)) room.stTalk = talk;
-    updateVoice(room);
+    if (!ctx || ctx.room.phase !== "match" || ctx.player.id === ctx.room.hostId) return;
+    const host = ctx.room.host();
+    if (host) send(host.ws, "in", { ...msg, id: ctx.player.id });
   },
 
-  // ----- Connexion vocale (deuxième connexion, ouverte par l'extension JavaScript) -----
-  voice_hello(ws, msg) {
-    const found = findByToken(msg.code, msg.token);
-    if (!found) return send(ws, "v_error", { msg: "Room introuvable pour le vocal." });
-    const { room, player } = found;
-    if (player.voiceWs && player.voiceWs !== ws) {
-      player.voiceWs.voiceCtx = null;
-      player.voiceWs.close();
-    }
-    player.voiceWs = ws;
-    player.voiceSid = makeId(); // change à chaque connexion : les autres savent qu'il faut se reconnecter
-    ws.voiceCtx = { room, player };
-    updateVoice(room);
-    console.log(`[${room.code}] ${player.name} a activé le vocal`);
-  },
-
-  // Mesures techniques du vocal envoyées par un navigateur (diagnostic, voir /diag)
-  diag(ws, msg) {
-    const ctx = ws.voiceCtx;
-    if (!ctx || ctx.player.voiceWs !== ws || !msg.data || typeof msg.data !== "object") return;
-    const text = JSON.stringify(msg.data);
-    if (text.length > 20000) return;
-    // On remplace les identifiants des autres joueurs par leur pseudo (plus lisible)
-    if (Array.isArray(msg.data.peers)) {
-      for (const p of msg.data.peers) { const q = ctx.room.players.get(p.id); if (q) p.name = q.name + (q.isST ? " (Conteur)" : ""); }
-    }
-    if (Array.isArray(msg.data.sendTo)) msg.data.sendTo = msg.data.sendTo.map(id => (ctx.room.players.get(id) || { name: id }).name);
-    diagLog.push({ at: new Date().toISOString(), room: ctx.room.code, name: ctx.player.name, data: msg.data });
-    const limit = Date.now() - DIAG_KEEP_MS;
-    while (diagLog.length > DIAG_MAX || (diagLog.length && Date.parse(diagLog[0].at) < limit)) diagLog.shift();
-  },
-
-  // Message technique WebRTC à faire passer à un autre joueur
-  v_signal(ws, msg) {
-    const ctx = ws.voiceCtx;
-    if (!ctx || ctx.player.voiceWs !== ws) return;
-    const target = ctx.room.players.get(msg.to);
-    if (!target || !target.voiceWs) return;
-    send(target.voiceWs, "v_signal", { from: ctx.player.id, sid: ctx.player.voiceSid, data: msg.data });
-  },
-
-  // Un message écrit privé
-  //  scope "st"   : joueur -> Conteur (privé)
-  //  scope "pm"   : Conteur -> un joueur (privé), avec "to" = id du joueur
-  say(ws, msg) {
+  // Image de l'arène calculée par l'hôte : relayée telle quelle aux autres joueurs
+  snap(ws, msg, text) {
     const ctx = ws.ctx;
-    if (!ctx || ctx.room.phase === "lobby") return;
-    const { room, player } = ctx;
-    const text = cleanText(msg.text, CHAT_MAX);
-    if (!text) return;
-    // Anti-spam : pas plus d'un message toutes les 300 ms
-    const now = Date.now();
-    if (now - player.lastChat < 300) return;
-    player.lastChat = now;
-
-    if (msg.scope === "st" && !player.isST) {
-      const data = { ch: "st", pid: player.id, from: player.name, fromId: player.id, text };
-      send(player.ws, "chat", data);
-      const st = room.storyteller();
-      if (st) send(st.ws, "chat", data);
-    } else if (msg.scope === "pm" && player.isST) {
-      const target = room.players.get(msg.to);
-      if (!target || target.isST) return;
-      const data = { ch: "st", pid: target.id, from: player.name, fromId: player.id, text };
-      send(target.ws, "chat", data);
-      send(player.ws, "chat", data);
+    if (!ctx || ctx.room.phase !== "match" || ctx.player.id !== ctx.room.hostId) return;
+    for (const p of ctx.room.players.values()) {
+      // Pas de file d'attente : si un joueur a une connexion lente, on saute des images
+      if (p !== ctx.player && p.ws && p.ws.readyState === p.ws.OPEN && p.ws.bufferedAmount < 256 * 1024) p.ws.send(text);
     }
   },
 };
-
-// Actions du grimoire (réservées au Conteur)
-Object.assign(handlers, grimHandlers, phaseHandlers, voteHandlers, speakHandlers);
 
 function leaveCurrentRoom(ws) {
   const ctx = ws.ctx;
   if (!ctx) return;
   ws.ctx = null;
-  const { room, player } = ctx;
+  removePlayer(ctx.room, ctx.player);
+}
+
+function removePlayer(room, player) {
   room.players.delete(player.id);
   console.log(`[${room.code}] ${player.name} est parti`);
-  if (player.voiceWs) {
-    player.voiceWs.voiceCtx = null;
-    player.voiceWs.close();
-    player.voiceWs = null;
-  }
-  if (room.stTalk === player.id) room.stTalk = "none";
-  if (room.grim) delete room.grim.players[player.id];
-
   if (room.players.size === 0) {
     rooms.delete(room.code);
     console.log(`[${room.code}] supprimée (vide)`);
     return;
   }
-  // Si le Conteur part, le joueur suivant devient Conteur (uniquement dans le lobby)
-  if (player.isST && room.phase === "lobby") {
-    const next = room.players.values().next().value;
-    next.isST = true;
-    room.storytellerId = next.id;
-    send(next.ws, "info", { msg: "Tu es maintenant le Conteur." });
+  // L'hôte part : le joueur suivant devient l'hôte ; un combat en cours s'arrête
+  if (player.id === room.hostId) {
+    const next = [...room.players.values()].find(p => p.connected) || room.players.values().next().value;
+    room.hostId = next.id;
+    send(next.ws, "info", { msg: "Tu es maintenant l'hôte de la room." });
+    if (room.phase === "match") return room.toLobby(`${player.name} (l'hôte) est parti : combat arrêté.`);
   }
   room.broadcastPlayers();
-  room.broadcastPositions();
-  if (room.phase !== "lobby") sendGrimoire(room);
-  updateVoice(room);
 }
 
 // ---------- Serveur HTTP + WebSocket ----------
@@ -489,18 +291,6 @@ const server = http.createServer((req, res) => {
   const url = new URL(req.url, "http://localhost");
 
   // Petite page pour vérifier que le serveur tourne (utile pour Render)
-  // Diagnostic du vocal (mesures techniques, jamais le son) : protégé par une clé
-  if (url.pathname === "/diag") {
-    if (url.searchParams.get("key") !== DIAG_KEY) {
-      res.writeHead(403);
-      return res.end();
-    }
-    const room = url.searchParams.get("room");
-    const list = room ? diagLog.filter(d => d.room === room.toUpperCase()) : diagLog;
-    res.writeHead(200, { "Content-Type": "application/json; charset=utf-8", "Cache-Control": "no-store" });
-    return res.end(JSON.stringify(list));
-  }
-
   if (url.pathname === "/health") {
     res.writeHead(200, { "Content-Type": "text/plain; charset=utf-8" });
     return res.end(`Serveur StickFlat en ligne - ${rooms.size} room(s)\n`);
@@ -540,7 +330,8 @@ const server = http.createServer((req, res) => {
   });
 });
 
-const wss = new WebSocketServer({ server, maxPayload: 64 * 1024 });
+// Les images de l'arène (snap) peuvent être grosses : 1 Mo maximum par message
+const wss = new WebSocketServer({ server, maxPayload: 1024 * 1024 });
 
 wss.on("connection", ws => {
   ws.ctx = null;
@@ -550,36 +341,39 @@ wss.on("connection", ws => {
   ws.on("message", raw => {
     // GameMaker peut envoyer un caractère nul en fin de texte : on l'enlève
     const text = raw.toString("utf8").replace(/\0+$/, "");
+    // Image de l'arène : on la relaie sans la décoder (c'est le message le plus fréquent et le plus gros)
+    if (text.startsWith('{"t":"snap"')) return handlers.snap(ws, null, text);
     let msg;
     try { msg = JSON.parse(text); } catch { return; }
     if (!msg || typeof msg.t !== "string") return;
     const handler = Object.hasOwn(handlers, msg.t) && handlers[msg.t];
     if (!handler) return;
-    try { handler(ws, msg); } catch (err) { console.error("Erreur:", err); }
+    try { handler(ws, msg, text); } catch (err) { console.error("Erreur:", err); }
   });
 
   ws.on("close", () => {
-    // Quelqu'un qui partait avant la fin de son décompte d'arrivée
-    if (ws.pendingJoin) {
-      const { room, pend } = ws.pendingJoin;
-      clearTimeout(pend.timer);
-      room.pending = room.pending.filter(x => x !== pend);
-      room.broadcast("incoming_cancel", { name: pend.name });
-      ws.pendingJoin = null;
-    }
-    // Fermeture d'une connexion vocale
-    const vctx = ws.voiceCtx;
-    if (vctx && vctx.player.voiceWs === ws) {
-      vctx.player.voiceWs = null;
-      updateVoice(vctx.room);
-    }
     const ctx = ws.ctx;
     if (!ctx) return;
-    // On garde le joueur dans la room : il pourra revenir avec son token
-    ctx.player.connected = false;
-    ctx.player.ws = null;
-    if (ctx.room.connectedCount() === 0) ctx.room.emptySince = Date.now();
-    ctx.room.broadcastPlayers();
+    const { room, player } = ctx;
+    // Dans le choix des persos, on libère la place tout de suite ; pendant un combat,
+    // on garde le joueur : il pourra revenir avec son token
+    if (room.phase === "lobby") {
+      ws.ctx = null;
+      return removePlayer(room, player);
+    }
+    player.connected = false;
+    player.ws = null;
+    if (room.connectedCount() === 0) room.emptySince = Date.now();
+    // L'hôte a disparu pendant le combat : plus personne ne fait tourner l'arène
+    if (player.id === room.hostId) {
+      const next = [...room.players.values()].find(p => p.connected);
+      if (next) {
+        room.hostId = next.id;
+        room.toLobby(`${player.name} (l'hôte) a été déconnecté : combat arrêté.`);
+        return;
+      }
+    }
+    room.broadcastPlayers();
   });
 });
 

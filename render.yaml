@@ -11,4 +11,4 @@ services:
     healthCheckPath: /health
     envVars:
       - key: MIN_PLAYERS
-        value: "1"
+        value: "2"
