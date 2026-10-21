@@ -474,6 +474,8 @@ const MIME = {
 // Version Windows (installateur rangé par construire.ps1) : bouton discret en bas à gauche, refermable
 const INDEX_FILE = path.join(PUBLIC_DIR, "index.html");
 const WINDOWS_EXE = path.join(PUBLIC_DIR, "telechargement", "StickFlat-Windows.exe");
+// Même couleur que PAPER dans le jeu (scr_sketch), sans barres de défilement
+const PAGE_STYLE = `<style>html, body { background: #f4eddc !important; overflow: hidden; }</style>\n`;
 const DOWNLOAD_BUTTON = `
 <div id="dl-win" style="position:fixed;left:10px;bottom:10px;z-index:10;font:13px sans-serif;display:flex;gap:4px">
   <a href="/telechargement/StickFlat-Windows.exe" download
@@ -525,9 +527,12 @@ const server = http.createServer((req, res) => {
     const headers = { "Content-Type": type, "Cache-Control": "no-cache" };
     // L'installateur Windows se télécharge au lieu de s'ouvrir
     if (ext === ".exe") headers["Content-Disposition"] = `attachment; filename="${path.basename(file)}"`;
-    // Page du jeu : on ajoute le bouton "Télécharger pour Windows" (l'export GameMaker est refait à chaque build)
-    if (file === INDEX_FILE && fs.existsSync(WINDOWS_EXE)) {
-      data = Buffer.from(data.toString("utf8").replace("</body>", DOWNLOAD_BUTTON + "</body>"));
+    // Page du jeu (l'export GameMaker est refait à chaque build) : fond couleur papier autour du jeu
+    // au lieu des bandes noires, et bouton "Télécharger pour Windows"
+    if (file === INDEX_FILE) {
+      let html = data.toString("utf8").replace("</head>", PAGE_STYLE + "</head>");
+      if (fs.existsSync(WINDOWS_EXE)) html = html.replace("</body>", DOWNLOAD_BUTTON + "</body>");
+      data = Buffer.from(html);
     }
     // "no-cache" : le navigateur vérifie toujours qu'il a la dernière version du jeu
     res.writeHead(200, headers);
