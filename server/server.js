@@ -468,7 +468,20 @@ const MIME = {
   ".jpg": "image/jpeg", ".gif": "image/gif", ".ico": "image/x-icon", ".svg": "image/svg+xml",
   ".ogg": "audio/ogg", ".mp3": "audio/mpeg", ".wav": "audio/wav", ".wasm": "application/wasm",
   ".txt": "text/plain; charset=utf-8", ".ttf": "font/ttf", ".woff": "font/woff", ".woff2": "font/woff2",
+  ".exe": "application/vnd.microsoft.portable-executable",
 };
+
+// Version Windows (installateur rangé par construire.ps1) : bouton discret en bas à gauche, refermable
+const INDEX_FILE = path.join(PUBLIC_DIR, "index.html");
+const WINDOWS_EXE = path.join(PUBLIC_DIR, "telechargement", "StickFlat-Windows.exe");
+const DOWNLOAD_BUTTON = `
+<div id="dl-win" style="position:fixed;left:10px;bottom:10px;z-index:10;font:13px sans-serif;display:flex;gap:4px">
+  <a href="/telechargement/StickFlat-Windows.exe" download
+     style="background:#222c;color:#fff;padding:6px 10px;border-radius:6px;text-decoration:none">&#11015; Télécharger pour Windows</a>
+  <button onclick="this.parentNode.remove()" title="Masquer"
+     style="background:#222c;color:#fff;border:0;border-radius:6px;cursor:pointer">&times;</button>
+</div>
+`;
 
 const server = http.createServer((req, res) => {
   const url = new URL(req.url, "http://localhost");
@@ -507,9 +520,17 @@ const server = http.createServer((req, res) => {
         ? "Le jeu n'est pas encore installé : exporte-le en HTML5 dans server/public.\n"
         : "Introuvable\n");
     }
-    const type = MIME[path.extname(file).toLowerCase()] || "application/octet-stream";
+    const ext = path.extname(file).toLowerCase();
+    const type = MIME[ext] || "application/octet-stream";
+    const headers = { "Content-Type": type, "Cache-Control": "no-cache" };
+    // L'installateur Windows se télécharge au lieu de s'ouvrir
+    if (ext === ".exe") headers["Content-Disposition"] = `attachment; filename="${path.basename(file)}"`;
+    // Page du jeu : on ajoute le bouton "Télécharger pour Windows" (l'export GameMaker est refait à chaque build)
+    if (file === INDEX_FILE && fs.existsSync(WINDOWS_EXE)) {
+      data = Buffer.from(data.toString("utf8").replace("</body>", DOWNLOAD_BUTTON + "</body>"));
+    }
     // "no-cache" : le navigateur vérifie toujours qu'il a la dernière version du jeu
-    res.writeHead(200, { "Content-Type": type, "Cache-Control": "no-cache" });
+    res.writeHead(200, headers);
     res.end(data);
   });
 });

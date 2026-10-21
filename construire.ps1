@@ -41,6 +41,15 @@ Write-Host "2/3  Mise en place dans server\public..." -ForegroundColor Yellow
 if (Test-Path (Join-Path $Public "html5game")) { Remove-Item (Join-Path $Public "html5game") -Recurse -Force }
 Copy-Item (Join-Path $Sortie "*") $Public -Recurse -Force
 
+# Installateur Windows cree depuis GameMaker (stickflat.exe pose dans ce dossier) : propose au telechargement sur le site
+$Exe = Join-Path $Racine "stickflat.exe"
+if (Test-Path $Exe) {
+	$Dl = Join-Path $Public "telechargement"
+	New-Item -ItemType Directory -Force $Dl | Out-Null
+	Move-Item $Exe (Join-Path $Dl "StickFlat-Windows.exe") -Force
+	Write-Host "     Version Windows ajoutee au site (bouton Telecharger)." -ForegroundColor Yellow
+}
+
 if ($SansEnvoi) { Write-Host "Construit (rien n'a ete envoye)." -ForegroundColor Green; exit 0 }
 
 Write-Host "3/3  Envoi sur GitHub (Render mettra le site a jour en 1 a 3 minutes)..." -ForegroundColor Yellow
