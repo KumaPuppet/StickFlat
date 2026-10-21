@@ -36,6 +36,7 @@ function __sfxInit() {
 	if (!AC) return null;
 	var ctx = new AC();
 	__sfx.ctx = ctx;
+	if (__sfx.sink) __sfxApplySink(ctx); // sortie audio choisie (voir plus bas)
 	// Petit compresseur : les explosions et les rafales ne saturent pas
 	var comp = ctx.createDynamicsCompressor();
 	comp.threshold.value = -14; comp.knee.value = 8; comp.ratio.value = 5;
@@ -350,5 +351,78 @@ function sfx_set_volume(v) {
 function sfx_set_mute(on) {
 	__sfx.muted = !!on;
 	if (__sfx.master) __sfx.master.gain.value = __sfx.muted ? 0 : __sfx.volume;
+	return 1;
+}
+
+// =============================================================
+//  SORTIE AUDIO (casque, enceintes...) : Chrome et Edge (AudioContext.setSinkId)
+//  Les bruitages (ce fichier) et la musique (son GameMaker, g_WebAudioContext)
+//  partent tous les deux vers la sortie choisie.
+// =============================================================
+__sfx.sink = "";          // sortie choisie ("" = celle du système)
+__sfx.outs = [];          // sorties trouvées : [{ id, label }]
+__sfx.outState = "idle";  // "idle", "asking", "ready", "denied"
+
+function __sfxSupportsSink() {
+	var AC = window.AudioContext || window.webkitAudioContext;
+	return !!(AC && AC.prototype && typeof AC.prototype.setSinkId === "function"
+		&& navigator.mediaDevices && navigator.mediaDevices.enumerateDevices);
+}
+
+function __sfxApplySink(ctx) {
+	if (!ctx || typeof ctx.setSinkId !== "function") return;
+	try {
+		var p = ctx.setSinkId(__sfx.sink);
+		if (p && p.catch) p.catch(function () {});
+	} catch (e) {}
+}
+
+function __sfxListOutputs() {
+	return navigator.mediaDevices.enumerateDevices().then(function (devs) {
+		var outs = [];
+		devs.forEach(function (d) {
+			// "default" et "communications" sont des alias de Windows : on garde les vraies sorties
+			if (d.kind === "audiooutput" && d.deviceId && d.deviceId !== "default" && d.deviceId !== "communications") {
+				outs.push({ id: d.deviceId, label: d.label || "" });
+			}
+		});
+		return outs;
+	});
+}
+
+/// Cherche les sorties audio. ask = 1 : demande l'autorisation si les noms sont cachés
+/// (le navigateur ne donne le nom des sorties qu'après l'accès au micro, coupé aussitôt)
+function sfx_out_scan(ask) {
+	if (!__sfxSupportsSink()) return 0;
+	__sfxListOutputs().then(function (outs) {
+		var named = outs.length > 0 && outs.every(function (o) { return o.label !== ""; });
+		if (named || !ask) {
+			__sfx.outs = named ? outs : [];
+			if (named) __sfx.outState = "ready";
+			return;
+		}
+		__sfx.outState = "asking";
+		navigator.mediaDevices.getUserMedia({ audio: true }).then(function (stream) {
+			stream.getTracks().forEach(function (t) { t.stop(); });
+			return __sfxListOutputs().then(function (outs2) {
+				__sfx.outs = outs2;
+				__sfx.outState = "ready";
+			});
+		}).catch(function () { __sfx.outState = "denied"; });
+	}).catch(function () {});
+	return 1;
+}
+
+/// État pour GameMaker (texte JSON) : { ok, state, outs: [{ id, label }] }
+function sfx_out_info() {
+	return JSON.stringify({ ok: __sfxSupportsSink() ? 1 : 0, state: __sfx.outState, outs: __sfx.outs });
+}
+
+/// Choisit la sortie ("" = celle du système), pour les bruitages et la musique
+function sfx_out_set(id) {
+	if (!__sfxSupportsSink()) return 0;
+	__sfx.sink = String(id || "");
+	__sfxApplySink(__sfx.ctx);
+	if (typeof g_WebAudioContext !== "undefined") __sfxApplySink(g_WebAudioContext);
 	return 1;
 }
